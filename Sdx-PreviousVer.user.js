@@ -1,209 +1,77 @@
 // ==UserScript==
 // @name         SDx Previous Document Version Finder
 // @namespace    bmcd-sdx-Previous
-// @version      2.0
-// @description  Finds previous SDx document versions and consolidated (previously-reviewed) renditions from viewAndMarkup pages.
+// @version      3.0.0
+// @description  Finds previous SDx document versions and consolidated (previously reviewed) renditions, and opens the consolidated PDF side by side with the document under review.
 // @author       Josue Gutierrez
 // @match        https://bum04-sdx.intergraphsmartcloud.com/*
+// @match        https://sdx-qarc.burnsmcd.com/*
 // @run-at       document-start
 // @grant        GM_addStyle
 // @grant        GM_openInTab
 // @grant        GM_setClipboard
-// @downloadURL https://raw.githubusercontent.com/JGtz-BMcD/SDx-PreviousVer/main/Sdx-PreviousVer.user.js
-// @updateURL https://raw.githubusercontent.com/JGtz-BMcD/SDx-PreviousVer/main/Sdx-PreviousVer.user.js
+// @grant        GM_getResourceText
+// @resource     pdfjsLib    https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js#sha256-W1eZ5vjGgGYyB6xbQu4U7tKkBvp69I9QwVTwwLFWaUY=
+// @resource     pdfjsWorker https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js#sha256-/qvfMJdw7SS7oxpUZ4Ns3Iz2OccFryfVK1hbBBu4Uns=
 // ==/UserScript==
 /*
- * v1.1 changelog (auth hardening, mirrors verified fixes in the
- * sibling "SDx Searcher" and "SDx Reviewer" scripts):
- *  - Token is now persisted to localStorage (shared across tabs on
- *    this origin), not just sessionStorage (scoped to one tab).
- *    SDx opens review/history views in NEW tabs, so a token only
- *    captured into sessionStorage never reached those tabs - this
- *    was the actual root cause of "works after I search once
- *    elsewhere, still 401s here."
- *  - Live 'storage' event listener picks up a token captured in
- *    another SDx tab with no manual refresh.
- *  - JWT payload is decoded to check `exp` before trusting a cached
- *    token, so a stale token is proactively discarded instead of
- *    firing a request we already know will 401.
- *  - On a 401/403, the cached token is invalidated and storage is
- *    re-scanned once for a fresher one before failing.
- *  - Storage scan now also checks cookies, and keeps scanning past
- *    the first hit to prefer the token with the longest remaining
- *    life.
- *  - Added a visible token status readout + "Force Re-scan Token"
- *    button for manual recovery.
- *  - Added defensive SPFCreateConfigUID / SPFQueryConfigUID request
- *    headers alongside spfconfiguid (a sibling script found the SDx
- *    server keys project scoping off these on some endpoints).
- *  - Route-change detection now also listens for hashchange/popstate
- *    (interval polling kept as a fallback safety net).
+ * SDx Previous Document Version Finder
  *
- * v1.2 changelog:
- *  - Added an explicit "x" close button on the panel.
- *  - Panel now auto-closes when you click outside it (including a
- *    best-effort detection of focus moving into an iframe, since a
- *    click inside an iframe never bubbles to this document), and
- *    auto-closes after an idle timeout (default 20s, resets on any
- *    interaction with the panel, 0 = disabled).
- *  - Added a Settings section (persisted in localStorage) to change
- *    the auto-close idle timeout and how many results are shown.
- *    Max results is hard-capped at 20 regardless of what's entered.
- *  - Added a "Consolidated Renditions" check: searches
- *    bmcdConsolidatedDocRenditions (the project's consolidated,
- *    previously-reviewed PDF renditions with prior comments) for the
- *    same document and, if a likely match is found, surfaces it in a
- *    red callout at the top of results with a direct-open button.
+ * What it does
+ *  - Finds earlier revisions and consolidated renditions (documents
+ *    returned after a previous review round) for the document you are
+ *    reviewing, using the SDx REST API with your own signed-in session.
+ *  - Adds a "Prev Doc Ver" button to the Bluebeam toolbar row of the
+ *    reviewer pane (including the "Perform Consolidation" route).
+ *  - Checks automatically in the background when a document is opened
+ *    and, on an exact consolidated match, shows a small popup offering
+ *    to open it side by side.
+ *  - Side-by-side viewer (PDF.js): docked beside the document under
+ *    review, keeps the Document Summary pane, synced page-by-page
+ *    scroll, zoom follow/entry, Download, Open in tab, Tiled window.
+ *    It is tied to the review tab it was opened in.
  *
- * v1.3 changelog:
- *  - Fixed the Consolidated Renditions search 400ing on every query:
- *    it was filtering on Alt_Doc_Name/Title/Attached_File fields that
- *    this entity doesn't appear to have. Narrowed to filter on Name
- *    only (confirmed against a live SDx browse URL), and gave it its
- *    own query list built from the document number instead of reusing
- *    the title-heavy main-entity query list. Matching against the
- *    detected document now also accepts the short "PKG-SEQ" form
- *    (e.g. "CIT-0276") since the consolidated entity's Name field
- *    doesn't include the project number prefix.
- *  - Auto-close is now OFF by default (it was closing the panel too
- *    eagerly). It's fully inert - idle timer, outside-click, and
- *    iframe-focus close all skip their checks - until explicitly
- *    turned on via the new "Enable auto-close" checkbox in Settings.
- *  - Reopening the panel (button, Alt+P, or after an auto-close) no
- *    longer wipes out the last search's results. It used to force a
- *    full "clear and redetect" every time it opened; now it just
- *    refreshes the header fields and leaves whatever was already
- *    found on screen, noting that they're prior results.
- *  - Button layout: "Find Previous Versions" stays a full-width
- *    primary action; Refresh Detection / Force Re-scan Token /
- *    Settings are now a 2-column grid instead of stacked rows; Copy
- *    Debug moved inside the Settings section.
+ * How it is built
+ *  - One script, three roles: the top SDx page (full UI), the extension
+ *    frame on sdx-qarc.burnsmcd.com (reads the Document Summary, lays out
+ *    the dock, reports the active tab) and the nested SDx viewer frames
+ *    (toolbar button, scroll and zoom reporting). The roles talk through
+ *    origin-checked postMessage.
+ *  - Generic by design: nothing is hardcoded to a user, token or project.
+ *    The project is read from the page URL, the token is captured from
+ *    the user's own SDx traffic, and tenant-wide constants can be changed
+ *    under Settings > Advanced.
  *
- * v1.4 changelog:
- *  - Got a real raw record back from bmcdConsolidatedDocRenditions, so
- *    normalizeConsolidatedItem() now maps its actual fields (Name,
- *    Alt_Doc_Name, Title, Doc_Rev, Sys_Rev, Contract, Submittal,
- *    Classification, Rev_State, Return_Code, Actual_Returned,
- *    Actual_Received, Id, UID) instead of guessing. There is NO direct
- *    PDF/file-URL field on this entity at all - the old guessed
- *    directFileUrl field list is removed.
- *  - "Open Consolidated PDF" is replaced with the same OBID-based
- *    "Open History" mechanism already used for the main results list:
- *    the record's "Id" field (e.g. "SDFK000A") matches the same OBID
- *    shape used elsewhere and is fed through the existing
- *    collectObidCandidates/HistoryViewRoute machinery, with a
- *    guaranteed-working "Open Consolidated Renditions List" fallback
- *    (filtered on the confirmed Name field) alongside it.
- *  - The red callout now also shows Contract, Rev State, Return Code,
- *    and Classification from the real record, and matches are sorted
- *    by Doc_Rev (falling back to date) so the newest consolidated
- *    revision surfaces first.
+ * Security notes
+ *  - The bearer token is only ever sent to the SDx origin it came from.
+ *    Captured tokens must look like a JWT, are checked for expiry, and are
+ *    kept in this origin's session/local storage (as the sibling SDx
+ *    scripts do so new tabs can reuse it). Copy Debug never includes it.
+ *  - All text from the page, API and PDF reaches the DOM via textContent
+ *    or escapeHtml. OData values are quote-escaped; entity and method
+ *    identifiers are restricted to [A-Za-z0-9_].
+ *  - postMessage handlers check origin and source and validate every
+ *    field; messages are only posted to a fixed target origin.
+ *  - PDF.js 3.11.174 is pinned with Subresource Integrity hashes and runs
+ *    with isEvalSupported:false (the documented mitigation for
+ *    CVE-2024-4367). That release line no longer receives fixes; revisit
+ *    this pin if PDF.js ships a classic-script build again.
+ *  - Files are fetched only over https; opened links must be https.
  *
- * v1.5 changelog:
- *  - HistoryViewRoute is CONFIRMED invalid for this entity (live test
- *    returned "The URL you are navigating to is not valid... Method
- *    name: HistoryRoute"), so it's removed for consolidated items.
- *    A network capture of the real "open PDF" flow shows the actual
- *    record's Id field (e.g. "TJNJ000A") is NOT what RetrieveFileUris
- *    is called with - the app resolves it to a separate File
- *    Composition OBID first (e.g. "TJNJ003A") via an SPFFileComposition
- *    lookup, then POSTs Files('{compositionObid}')/Intergraph.SPF.
- *    Server.API.Model.RetrieveFileUris to get the actual file URL.
- *    Both of those steps still need to be confirmed (the lookup
- *    filter shape and the POST body/response) before a one-click
- *    "Open PDF" button can be wired up, so for now the primary action
- *    is the verified-working Consolidated Renditions list link only.
- *
- * v1.6 changelog:
- *  - Full "Open Consolidated PDF" flow, confirmed against a live
- *    network capture of the two calls the native SDx UI makes:
- *      1. GET Objects('{Id}')/SPFFileComposition_21
- *         ?$filter=SPFViewInd eq true&$top=1
- *         resolves the rendition's Id (e.g. "SDI7000A") to a File
- *         OBID (e.g. "SDI7003A").
- *      2. POST Files('{fileObid}')/Intergraph.SPF.Server.API.Model.
- *         RetrieveFileUris with body {"purposes":["Markup"],
- *         "downloadFile":false} returns a directly-openable Uri to
- *         the actual PDF.
- *    The consolidated callout's primary button now runs this chain
- *    on click and opens the resulting PDF directly. The Consolidated
- *    Renditions list link is kept as a secondary fallback in case the
- *    lookup ever comes back empty.
- *
- * v1.7 changelog:
- *  - Fixed "Invalid $filter parameter supplied" on the Consolidated
- *    Renditions list fallback link: buildDocumentsListUrl() was still
- *    filtering on Alt_Doc_Name/Title/Attached_File for that entity,
- *    which doesn't have them (same root cause as the earlier raw API
- *    fix). It now filters by the correct field list per entity.
- *  - Fixed sibling sheets in the same drawing set (e.g. "Stack, 3D
- *    View & Connection details (Sheet 1)" vs "(Sheet 2)") getting
- *    misidentified as revisions/matches of each other. The loose
- *    "3+ title words overlap" fallback match is gone from both the
- *    Consolidated Renditions matching and the "Previous Document
- *    Versions" grouping - both now require an exact document number
- *    match, since title-word overlap is meaningless when every sheet
- *    in a series shares near-identical boilerplate titles. (The
- *    broader "All likely API matches" list still uses word-overlap
- *    scoring, since that list is meant to be a broad net.)
- *  - Split the old single "auto-close" toggle into two independent
- *    settings: "close on outside click" (default ON, matches the
- *    original request) and "idle timeout auto-close" (default OFF,
- *    the part that was too aggressive).
- *  - "All likely API matches" now defaults to showing 5 instead of
- *    12 (still adjustable in Settings, still hard-capped at 20).
- *  - Removed the Updated/Created fields from the main results and
- *    Previous Document Versions displays - the AllDocuments entity
- *    doesn't appear to populate any of the date field names this
- *    script knows about, so they were always blank clutter. (The
- *    Consolidated Renditions callout's "Returned" date is unaffected
- *    - that one's real.)
- *  - Bigger, full-width "Find Previous Versions" button; the
- *    secondary button grid below it is slightly smaller.
- *  - Added a "back to top" button that appears once you've scrolled
- *    down a bit in a long results list.
- *
- * v2.0 changelog - first version intended for sharing with other
- * personnel (their own SDx login, likely different SDx projects):
- *  - CRITICAL multi-project fix: the project config UID/value
- *    (previously hardcoded to PR_186688 / 186688) is now detected
- *    from the current page's own URL on every load and route change,
- *    via the same `config=["PR_XXXXXX"]` segment this script already
- *    reads/writes when building its own links elsewhere. Without this
- *    fix, every other user's searches - regardless of which project
- *    they were actually reviewing - would have been silently scoped
- *    to project 186688, mixing document results across unrelated
- *    projects/clients. A "Project" row in the panel shows what was
- *    detected; if detection ever fails, it falls back to PR_186688
- *    and visibly flags that it's a fallback rather than failing
- *    silently. The entity/method identifiers (AllDocuments_68290,
- *    the HistoryViewRoute method OBID, the Consolidated Renditions
- *    entity name) appear to be tenant-wide constants rather than
- *    per-project, so they're left as-is but exposed as editable
- *    Advanced Settings in case a different project turns out to need
- *    different values.
- *  - Added a visible progress bar while a search is running - the
- *    query-by-query status text alone was easy to miss.
- *  - Fixed max-results defaulting to 12: the settings storage key was
- *    reused from earlier testing where 12 was the default and had
- *    already been saved, so the new default of 5 never took effect
- *    for that saved value. Storage key bumped to a new name for a
- *    clean slate.
- *  - Fixed the "back to top" button actually closing the popup: it's
- *    a separate floating element (not a child of the panel), so the
- *    outside-click-close handler was treating clicks on it as
- *    "outside" and closing the panel out from under it. It's now
- *    explicitly recognized as part of the popup UI.
- *  - Security/sharing audit: confirmed no credentials, tokens, or
- *    personal identifiers are hardcoded anywhere in this script - the
- *    only "identity" involved is whatever the browser's own SDx
- *    session already has, captured the same way the native UI itself
- *    authenticates. Every network call targets the SDx origin itself
- *    (same-origin fetches only, no third-party endpoints). Every
- *    place API/document data is inserted into the page goes through
- *    escapeHtml() first, so a document name/title containing HTML
- *    can't inject markup into the popup. Debug info only ever
- *    includes a truncated token preview, never the full token.
+ * Changelog
+ *  3.0.0  Consolidated release. Full code and security audit, changelog
+ *         cleaned up, dead code and the unused PDF.js 6.x loader removed,
+ *         hardcoded fallback project removed. New: no automatic popup when
+ *         the tab already has a side-by-side open.
+ *  2.x    Reviewer-pane support (Perform Consolidation route); toolbar
+ *         button via companion frames; docked side-by-side layout that keeps
+ *         the Document Summary pane; automatic background check and popup;
+ *         PDF.js viewer with page-by-page scroll sync, zoom follow, zoom
+ *         entry, Download; per-tab side-by-side; Add Document list handling.
+ *  1.x    Search for previous revisions via the OData API, consolidated
+ *         rendition lookup and PDF opening, token capture with expiry
+ *         checks and cross-tab sharing, strict document-number matching,
+ *         user settings (outside-click close, idle timeout, result count).
  */
 (function () {
   'use strict';
@@ -212,18 +80,25 @@
    *
    * Prevent duplicate buttons inside SDx embedded review/markup frames.
    ********************************************************************/
-  if (window.top !== window.self) {
+  const TOP_ORIGIN = 'https://bum04-sdx.intergraphsmartcloud.com';
+  const FRAME_ORIGIN = 'https://sdx-qarc.burnsmcd.com';
+  // Inside the SDx extension frame this script runs as a light
+  // "companion" (toolbar button, page text, viewer layout) - see
+  // startFrameModule(), launched at the bottom once everything it
+  // depends on has been initialized. Any other frame: do nothing.
+  const IS_COMPANION = window.top !== window.self;
+  const IS_QARC_COMPANION = IS_COMPANION && window.location.origin === FRAME_ORIGIN && window.parent === window.top;
+  const IS_VIEWER_COMPANION = IS_COMPANION && window.location.origin === TOP_ORIGIN;
+  if (IS_COMPANION && !IS_QARC_COMPANION && !IS_VIEWER_COMPANION) {
     return;
   }
   /********************************************************************
    * SETTINGS
    ********************************************************************/
-  // Used ONLY if the project can't be detected from the current page's
-  // own URL (see detectProjectConfigUid/refreshProjectConfig below).
-  // Every other user opens their own projects, so this must never be
-  // relied on as the real value - it's a last-resort fallback, and the
-  // UI visibly flags it as such when it's actually being used.
-  const FALLBACK_PROJECT_CONFIG_UID = 'PR_186688';
+  // Intentionally empty: the project is always read from the page URL
+  // (see detectProjectConfigUid/refreshProjectConfig below) because every
+  // user works in their own projects. The UI flags when none is detected.
+  const FALLBACK_PROJECT_CONFIG_UID = '';
   const SETTINGS = {
     buttonRightPx: 330,
     buttonBottomPx: 22,
@@ -267,10 +142,8 @@
   /********************************************************************
    * USER-CONFIGURABLE SETTINGS (persisted locally, per browser)
    ********************************************************************/
-  // Bumped to a new key name for v2.0 - the settings shape changed
-  // (autoCloseEnabled split into two booleans) and the old key already
-  // had a max-results value saved from earlier testing that would
-  // otherwise silently override today's new default of 5.
+  // Key name is versioned so a future change of the settings shape can
+  // start clean.
   const SETTINGS_STORAGE_KEY = 'sdx-prevsub-user-settings-v2';
   const DEFAULT_USER_SETTINGS = {
     // Closing when you click outside the popup (or into the SDx
@@ -284,7 +157,9 @@
     // Advanced/escape-hatch overrides - see the SETTINGS comment above
     // for why these (unlike the project UID) aren't auto-detected.
     advancedEntityType: 'AllDocuments_68290',
-    advancedHistoryMethodObid: '001A64A'
+    advancedHistoryMethodObid: '001A64A',
+    dockRightOffsetPx: 0,
+    autoCheckConsolidated: true
   };
   function clampNumber(value, min, max, fallback) {
     const n = Number(value);
@@ -306,7 +181,9 @@
         autoCloseSeconds: clampNumber(parsed.autoCloseSeconds, 0, 600, DEFAULT_USER_SETTINGS.autoCloseSeconds),
         maxDisplayedResults: clampNumber(parsed.maxDisplayedResults, 1, HARD_MAX_RESULTS, DEFAULT_USER_SETTINGS.maxDisplayedResults),
         advancedEntityType: cleanIdentifier(parsed.advancedEntityType, DEFAULT_USER_SETTINGS.advancedEntityType),
-        advancedHistoryMethodObid: cleanIdentifier(parsed.advancedHistoryMethodObid, DEFAULT_USER_SETTINGS.advancedHistoryMethodObid)
+        advancedHistoryMethodObid: cleanIdentifier(parsed.advancedHistoryMethodObid, DEFAULT_USER_SETTINGS.advancedHistoryMethodObid),
+        dockRightOffsetPx: clampNumber(parsed.dockRightOffsetPx, 0, 1200, 0),
+        autoCheckConsolidated: parsed.autoCheckConsolidated === undefined ? true : Boolean(parsed.autoCheckConsolidated)
       };
     } catch {
       return { ...DEFAULT_USER_SETTINGS };
@@ -319,7 +196,9 @@
       autoCloseSeconds: clampNumber(next.autoCloseSeconds, 0, 600, DEFAULT_USER_SETTINGS.autoCloseSeconds),
       maxDisplayedResults: clampNumber(next.maxDisplayedResults, 1, HARD_MAX_RESULTS, DEFAULT_USER_SETTINGS.maxDisplayedResults),
       advancedEntityType: cleanIdentifier(next.advancedEntityType, DEFAULT_USER_SETTINGS.advancedEntityType),
-      advancedHistoryMethodObid: cleanIdentifier(next.advancedHistoryMethodObid, DEFAULT_USER_SETTINGS.advancedHistoryMethodObid)
+      advancedHistoryMethodObid: cleanIdentifier(next.advancedHistoryMethodObid, DEFAULT_USER_SETTINGS.advancedHistoryMethodObid),
+      dockRightOffsetPx: clampNumber(next.dockRightOffsetPx, 0, 1200, 0),
+      autoCheckConsolidated: Boolean(next.autoCheckConsolidated)
     };
     try { localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(clamped)); } catch { /* non-fatal */ }
     Object.assign(USER_SETTINGS, clamped);
@@ -337,8 +216,7 @@
    *
    * The project config UID is re-derived from the current page's own
    * URL on every load and route change, rather than trusted from a
-   * hardcoded value - see the v2.0 changelog at the top of this file
-   * for why. This mirrors the same `config=["PR_XXXXXX"]` segment
+   * hardcoded value. This mirrors the same `config=["PR_XXXXXX"]` segment
    * this script already reads/writes when building its own links
    * (buildHistoryViewUrlFromObid, buildDocumentsListUrl, etc).
    ********************************************************************/
@@ -377,14 +255,26 @@
   function isViewAndMarkupRoute() {
     return /#\/viewAndMarkup(?:;|$)/i.test(window.location.href);
   }
+  // The reviewer pane has moved between routes across SDx releases:
+  // classic #/viewAndMarkup, and the newer extensibility host
+  // #/external;...;MethodName=BMcD_PerformConsolidation (or other
+  // review-style methods).
+  function isReviewExternalRoute() {
+    let href = window.location.href;
+    try { href = decodeURIComponent(href); } catch { /* use raw */ }
+    return /#\/external;/i.test(href) && /MethodName=[^;]*(consolidat|review)/i.test(href);
+  }
   function shouldShowHelper() {
     if (!SETTINGS.requireViewAndMarkupRoute) return true;
-    return isViewAndMarkupRoute();
+    return isViewAndMarkupRoute() || isReviewExternalRoute();
   }
   function removeUi() {
-    document.querySelector('#sdx-prevsub-btn')?.remove();
+    hideToast();
+    removeLaunchers();
     document.querySelector('#sdx-prevsub-panel')?.remove();
     document.querySelector('#sdx-prevsub-scroll-top')?.remove();
+    dockStates.clear();
+    closeDock();
   }
   function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -392,7 +282,7 @@
   /********************************************************************
    * SDx AUTH CAPTURE
    *
-   * See the v1.1 changelog at the top of this file for why this
+   * This is why this
    * section differs from a simple "grab one header and cache it"
    * approach.
    ********************************************************************/
@@ -565,14 +455,21 @@
     if (isTokenExpired(token, 0)) return { state: 'expired', label: `Token expired (${formatExpiry(token)})` };
     return { state: 'ok', label: `Token captured (${formatExpiry(token)})` };
   }
+  // Only tokens sent to the SDx origin itself are captured (never a
+  // token the page sends to some other service).
+  function isSdxUrl(url) {
+    try { return new URL(String(url), window.location.href).origin === TOP_ORIGIN; } catch { return false; }
+  }
   function installAuthSniffer() {
     if (window.fetch && !window.fetch.__sdxPrevSubWrapped) {
       const originalFetch = window.fetch;
       const wrappedFetch = function (input, init) {
         try {
-          rememberAuthorization(extractAuthorizationFromHeaders(init && init.headers));
-          if (input instanceof Request) {
-            rememberAuthorization(input.headers.get('authorization'));
+          if (isSdxUrl(input instanceof Request ? input.url : String(input && input.url || input))) {
+            rememberAuthorization(extractAuthorizationFromHeaders(init && init.headers));
+            if (input instanceof Request) {
+              rememberAuthorization(input.headers.get('authorization'));
+            }
           }
         } catch {
           // non-fatal
@@ -585,13 +482,13 @@
     if (window.XMLHttpRequest && !XMLHttpRequest.prototype.__sdxPrevSubWrapped) {
       const originalOpen = XMLHttpRequest.prototype.open;
       const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
-      XMLHttpRequest.prototype.open = function () {
-        this.__sdxPrevSubHeaders = {};
+      XMLHttpRequest.prototype.open = function (method, url) {
+        this.__sdxPrevSubUrl = url;
         return originalOpen.apply(this, arguments);
       };
       XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
         try {
-          if (String(name).toLowerCase() === 'authorization') {
+          if (String(name).toLowerCase() === 'authorization' && isSdxUrl(this.__sdxPrevSubUrl)) {
             rememberAuthorization(value);
           }
         } catch {
@@ -613,7 +510,7 @@
       });
     }
   }
-  installAuthSniffer();
+  if (!IS_COMPANION) installAuthSniffer();
   // Seed from whatever is already available (own storage, a sibling
   // script's storage, or cookies) before the first native SDx call.
   sdxCapturedAuthorization = getAuthorizationHeader() || '';
@@ -638,6 +535,18 @@
         cursor: pointer;
         box-shadow: 0 4px 12px rgba(0,0,0,0.25);
         opacity: 0.95;
+      }
+      #sdx-prevsub-btn.in-ribbon {
+        position: static;
+        height: 28px;
+        padding: 0 12px;
+        margin: 0 10px 0 0;
+        border-radius: 14px;
+        font: 700 12px "Segoe UI", Arial, sans-serif;
+        white-space: nowrap;
+        flex: 0 0 auto;
+        box-shadow: none;
+        opacity: 1;
       }
       #sdx-prevsub-btn:hover {
         opacity: 1;
@@ -872,6 +781,64 @@
         background: #a80000;
         border-color: #a80000;
       }
+      #sdx-prevsub-dock {
+        position: fixed;
+        bottom: 0;
+        z-index: 2147483000;
+        display: flex;
+        flex-direction: column;
+        background: #fff;
+        border-left: 1px solid #c8c8c8;
+        box-shadow: none;
+        font-family: Arial, sans-serif;
+      }
+      .sdx-prevsub-dock-handle {
+        position: absolute;
+        left: -8px;
+        top: 0;
+        bottom: 0;
+        width: 10px;
+        cursor: ew-resize;
+        z-index: 1;
+      }
+      .sdx-prevsub-dock-bar {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 8px;
+        background: #f5f5f5;
+        border-bottom: 1px solid #ddd;
+        color: #333;
+        font-size: 12px;
+      }
+      .sdx-prevsub-dock-bar span {
+        flex: 1;
+        font-weight: 600;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .sdx-prevsub-dock-bar button {
+        border: 1px solid #2d7fb8;
+        background: #fff;
+        color: #2d7fb8;
+        border-radius: 4px;
+        font-size: 11px;
+        padding: 3px 8px;
+        cursor: pointer;
+      }
+      #sdx-prevsub-dock-body {
+        flex: 1;
+        min-height: 0;
+        font-size: 12px;
+        color: #555;
+        padding: 0;
+      }
+      #sdx-prevsub-dock-body iframe {
+        width: 100%;
+        height: 100%;
+        border: 0;
+      }
       #sdx-prevsub-scroll-top {
         position: fixed;
         right: ${SETTINGS.buttonRightPx + 14}px;
@@ -924,10 +891,523 @@
   function unique(items) {
     return [...new Set(items.map(x => cleanText(x)).filter(Boolean))];
   }
+  // --- scroll helpers (used on both sides of the sync) ---
+  function findScrollElementIn(win) {
+    try {
+      const doc = win.document;
+      try {
+        const dv = win.Core && win.Core.documentViewer;
+        const el = dv && dv.getScrollViewElement && dv.getScrollViewElement();
+        if (el && el.scrollHeight > el.clientHeight + 20) return el;
+      } catch { /* try DOM lookups */ }
+      for (const sel of ['#DocumentContainer', '.DocumentContainer', '[id*="DocumentContainer" i]']) {
+        const el = doc.querySelector(sel);
+        if (el && el.scrollHeight > el.clientHeight + 20) return el;
+      }
+      let best = null;
+      doc.querySelectorAll('div').forEach(el => {
+        if (el.clientHeight > 200 && el.scrollHeight > el.clientHeight * 1.5) {
+          const oy = win.getComputedStyle(el).overflowY;
+          if (/auto|scroll/.test(oy) && (!best || el.scrollHeight > best.scrollHeight)) best = el;
+        }
+      });
+      return best;
+    } catch {
+      return null;
+    }
+  }
+  function getScrollFraction(el) {
+    const max = el.scrollHeight - el.clientHeight;
+    return max > 0 ? Math.min(1, Math.max(0, el.scrollTop / max)) : 0;
+  }
+  function pageAnchor(el, pages) {
+    if (!pages || !pages.length) return null;
+    const er = el.getBoundingClientRect();
+    for (let i = 0; i < pages.length; i++) {
+      const r = pages[i].getBoundingClientRect();
+      if (r.bottom > er.top + 1) return { p: i, pf: r.height > 0 ? Math.min(1, Math.max(0, (er.top - r.top) / r.height)) : 0 };
+    }
+    return { p: pages.length - 1, pf: 1 };
+  }
+  function setPageAnchor(el, pages, p, pf) {
+    if (!pages || !pages.length) return false;
+    const pg = pages[Math.min(Math.max(0, p), pages.length - 1)];
+    if (!pg) return false;
+    const er = el.getBoundingClientRect();
+    const r = pg.getBoundingClientRect();
+    el.scrollTop += (r.top - er.top) + Math.min(1, Math.max(0, pf)) * r.height;
+    return true;
+  }
+  function setScrollFraction(el, f) {
+    const max = el.scrollHeight - el.clientHeight;
+    if (max > 0) el.scrollTop = Math.min(1, Math.max(0, f)) * max;
+  }
+  // Companion running inside the SDx viewAndMarkup frame (nested under
+  // the sdx-qarc frame): owns the toolbar button.
+  function startViewerModule() {
+    const isPdftronFrame = /\/viewers\/pdftron\//i.test(window.location.pathname);
+    const viewerPages = () => {
+      try {
+        const list = Array.from(document.querySelectorAll('[id^="pageContainer"], .pageContainer'))
+          .filter((el, i, arr) => arr.indexOf(el) === i && el.getBoundingClientRect().height > 0);
+        const num = el => { const m = /(\d+)$/.exec(el.id || ''); return m ? Number(m[1]) : NaN; };
+        if (list.every(el => Number.isFinite(num(el)))) list.sort((a, b) => num(a) - num(b));
+        return list;
+      } catch { return []; }
+    };
+    let scrollEl = null;
+    let suppressUntil = 0;
+    let scrollRaf = 0;
+    let lastZoomSent = 0;
+    let urlTick = 0;
+    let showLauncher = false;
+    let lastError = '';
+    const tabKey = () => {
+      const re = /ContextObjectOBIDs=%5B%22([A-Za-z0-9]+)%22/;
+      try { const m = re.exec(window.location.href); if (m) return m[1]; } catch { /* ignore */ }
+      try { const m = re.exec(window.parent.location.href); if (m) return m[1]; } catch { /* ignore */ }
+      return '';
+    };
+    const post = msg => {
+      try { window.top.postMessage(Object.assign({ prevsub: true, from: 'viewer', tab: tabKey() }, msg), TOP_ORIGIN); } catch { /* non-fatal */ }
+    };
+    const rectOf = el => {
+      const r = el.getBoundingClientRect();
+      const off = getTopOffset(el);
+      return [r.left + off.left, r.top + off.top, r.right + off.left, r.bottom + off.top].map(Math.round);
+    };
+    if (isPdftronFrame) {
+      // Report this viewer's own URL/config (so the dock can open a
+      // second copy of it) and its scroll position (for synced scroll).
+      let zoomDiag = '';
+      const readZoom = () => {
+        const pct = /^(\d{1,3}(?:\.\d+)?)\s*%$/;
+        try {
+          let best = null;
+          const els = document.querySelectorAll('button,span,input,div,a,label');
+          for (const el of els) {
+            const raw = el.tagName === 'INPUT' ? String(el.value || '') : String(el.textContent || '');
+            const t = raw.replace(/[\s\u00a0]+/g, ' ').trim();
+            if (t.length > 8) continue;
+            const m = pct.exec(t) || (el.tagName === 'INPUT' && /^\d{1,3}$/.test(t) && /zoom/i.test(`${el.id} ${el.className} ${el.getAttribute('aria-label') || ''} ${el.getAttribute('data-element') || ''}`) ? [t, t] : null);
+            if (!m) continue;
+            const r = el.getBoundingClientRect();
+            if (r.width <= 0 || r.height <= 0 || r.top > 260) continue;
+            if (!best || el.getElementsByTagName('*').length < best.n) best = { z: parseFloat(m[1]) / 100, n: el.getElementsByTagName('*').length };
+          }
+          if (best) { zoomDiag = 'toolbar text'; return { z: best.z, src: 'toolbar' }; }
+          zoomDiag = 'no % text found in toolbar';
+        } catch (err) { zoomDiag = `dom scan error: ${String(err && err.message || err).slice(0, 60)}`; }
+        try {
+          const cands = [
+            window.Core && window.Core.documentViewer,
+            window.instance && window.instance.Core && window.instance.Core.documentViewer,
+            window.instance && window.instance.UI && window.instance.UI.getZoomLevel ? { getZoomLevel: () => window.instance.UI.getZoomLevel() } : null,
+            window.instance && window.instance.getZoomLevel ? { getZoomLevel: () => window.instance.getZoomLevel() } : null
+          ];
+          for (const dv of cands) {
+            if (!dv || typeof dv.getZoomLevel !== 'function') continue;
+            const z = dv.getZoomLevel();
+            if (z > 0) { zoomDiag += '; api ok'; return { z, src: 'api' }; }
+          }
+          zoomDiag += '; api: no usable getZoomLevel';
+        } catch (err) { zoomDiag += `; api error: ${String(err && err.message || err).slice(0, 60)}`; }
+        return null;
+      };
+      let zoomDiagSent = '';
+      setInterval(() => {
+        const zr = readZoom();
+        if (zr && Math.abs(zr.z - lastZoomSent) > 0.001) { lastZoomSent = zr.z; post({ type: 'zoom', z: zr.z, src: zr.src, diag: zoomDiag }); }
+        else if (!zr && zoomDiag !== zoomDiagSent) { zoomDiagSent = zoomDiag; post({ type: 'zoom-diag', diag: zoomDiag }); }
+      }, 400);
+      setInterval(() => {
+        try {
+          if (urlTick++ % 3 === 0) post({ type: 'viewer-url', url: window.location.href });
+
+          const el = findScrollElementIn(window);
+          if (el && el !== scrollEl) {
+            scrollEl = el;
+            el.addEventListener('scroll', () => {
+              if (Date.now() < suppressUntil || scrollRaf) return;
+              scrollRaf = requestAnimationFrame(() => {
+                scrollRaf = 0;
+                const a = pageAnchor(el, viewerPages());
+                post({ type: 'scroll', f: getScrollFraction(el), p: a ? a.p : undefined, pf: a ? a.pf : undefined });
+              });
+            }, { passive: true });
+          }
+        } catch { /* non-fatal */ }
+      }, 1000);
+    }
+    setInterval(() => {
+      try {
+        const c = findToolbarContainer();
+        let el = c ? c.querySelector('#' + LAUNCHER_ID) : null;
+        if (c && showLauncher && !el) {
+          el = buildLauncher(c.ownerDocument, true, {
+            press: () => post({ type: 'launcher-press' }),
+            click: () => post({ type: 'toggle-panel', rect: rectOf(el) })
+          });
+          c.appendChild(el);
+        }
+        if (el && !showLauncher) { el.remove(); el = null; }
+        if (el && c.lastElementChild !== el) c.appendChild(el); // keep it glued to the right end
+        let rect = el ? rectOf(el) : null;
+        if (rect && (rect[2] - rect[0] <= 0 || rect[3] - rect[1] <= 0)) rect = null;
+        post({
+          type: 'status',
+          present: Boolean(rect),
+          rect,
+          ribbon: (() => {
+            if (!c) return null;
+            let t = c;
+            const p = c.parentElement;
+            if (p && p.getBoundingClientRect().height <= 64) t = p;
+            return rectOf(t);
+          })(),
+          diag: {
+            version: '3.0.0',
+            where: 'viewer frame',
+            showLauncher,
+            containerFound: Boolean(c),
+            href: window.location.href.slice(0, 120),
+            frames: describeFrames(document, 0).slice(0, 8),
+            lastError
+          }
+        });
+      } catch (err) {
+        lastError = String(err && err.message || err).slice(0, 200);
+        post({ type: 'status', present: false, rect: null, diag: { version: '3.0.0', where: 'viewer frame', lastError } });
+      }
+    }, 1000);
+    window.addEventListener('message', e => {
+      if (e.origin !== TOP_ORIGIN || e.source !== window.top) return;
+      const d = e.data;
+      if (!d || d.prevsub !== true) return;
+      if (d.type === 'state') {
+        showLauncher = Boolean(d.show);
+      } else if (d.type === 'scroll-set' && scrollEl && (Number.isFinite(d.f) || Number.isFinite(d.p))) {
+        suppressUntil = Date.now() + 250;
+        const pgs = Number.isFinite(d.p) ? viewerPages() : [];
+        if (!(pgs.length && setPageAnchor(scrollEl, pgs, d.p, Number.isFinite(d.pf) ? d.pf : 0))) setScrollFraction(scrollEl, d.f);
+      }
+    });
+  }
+  // Companion instance running inside the sdx-qarc frame (direct child
+  // of the top window only).
+  function startFrameModule() {
+    if (window.parent !== window.top) return;
+    let showLauncher = false;
+    const post = msg => {
+      try { window.parent.postMessage(Object.assign({ prevsub: true }, msg), TOP_ORIGIN); } catch { /* non-fatal */ }
+    };
+    const rectOf = el => {
+      const r = el.getBoundingClientRect();
+      const off = getTopOffset(el);
+      return [r.left + off.left, r.top + off.top, r.right + off.left, r.bottom + off.top].map(Math.round);
+    };
+    // --- page text reporter
+    let lastText = '';
+    setInterval(() => {
+      try {
+        const text = cleanText(document.body ? document.body.innerText : '').slice(0, 20000);
+        if (text && text !== lastText) {
+          lastText = text;
+          post({ type: 'sdx-prevsub-frame-text', text });
+        }
+      } catch { /* non-fatal */ }
+    }, 1500);
+    // --- launcher in the Bluebeam toolbar row
+    let lastError = '';
+    const countRibbonish = () => {
+      let n = 0;
+      walkDocs(document, d => { try { n += d.querySelectorAll('[class*="ribbon" i]').length; } catch { /* ignore */ } return null; }, 0);
+      return n;
+    };
+    setInterval(() => {
+      try {
+        const c = findToolbarContainer();
+        const vf = findViewerFrameEl();
+        const vr = vf ? vf.getBoundingClientRect() : null;
+        post({
+          type: 'status',
+          present: false,
+          rect: null,
+          viewerFrameRect: vr ? [vr.left, vr.top, vr.right, vr.bottom].map(Math.round) : null,
+          diag: {
+            version: '3.0.0',
+            where: 'qarc frame',
+            showLauncher,
+            containerFound: Boolean(c),
+            ribbonish: countRibbonish(),
+            frames: describeFrames(document, 0).slice(0, 12),
+            lastError
+          }
+        });
+      } catch (err) {
+        lastError = String(err && err.message || err).slice(0, 200);
+        post({ type: 'status', present: false, rect: null, diag: { version: '3.0.0', where: 'qarc frame', lastError } });
+      }
+    }, 1000);
+    setInterval(() => {
+      try { post({ type: 'tabstate', activeTab: tabKeyOfFrame(findViewerFrameEl()), overlay: addDocumentOpen() }); } catch { /* non-fatal */ }
+    }, 300);
+    // --- messages from the top page
+    window.addEventListener('message', e => {
+      if (e.origin !== TOP_ORIGIN || e.source !== window.parent) return;
+      const d = e.data;
+      if (!d || d.prevsub !== true) return;
+      if (d.type === 'state') {
+        showLauncher = Boolean(d.show);
+      } else if (d.type === 'dock-layout') {
+        frameDockLayout(d);
+      } else if (d.type === 'dock-restore') {
+        restoreViewerColumn();
+        dockGeom = null;
+      }
+    });
+    function frameDockLayout(msg) {
+      if (msg.fresh || !dockGeom) {
+        restoreViewerColumn();
+        const rect = findRightPaneRect();
+        const rightOffset = Number(msg.rightOffset) > 0 ? Number(msg.rightOffset) : (rect ? Math.round(rect.width) : 380);
+        const rightLeft = window.innerWidth - rightOffset;
+        const col = findViewerColumn(rightLeft);
+        const cr = col ? col.getBoundingClientRect() : null;
+        const saved = {};
+        if (col) {
+          for (const prop of COL_PROPS) saved[prop] = { value: col.style.getPropertyValue(prop), priority: col.style.getPropertyPriority(prop) };
+        }
+        dockGeom = {
+          col, saved, rightLeft,
+          colLeft: cr ? Math.round(cr.left) : 0,
+          top: cr ? Math.round(cr.top) : (rect ? Math.max(0, Math.round(rect.top)) : 48),
+          bottom: cr ? Math.round(cr.bottom) : window.innerHeight
+        };
+      }
+      const g = dockGeom;
+      const available = Math.max(400, g.rightLeft - g.colLeft);
+      const requested = Number(msg.width) > 0 ? Number(msg.width) : Math.round(available * 0.5);
+      const width = Math.min(Math.max(280, requested), available - 300);
+      if (g.col) {
+        const colW = Math.round(available - width);
+        g.col.style.setProperty('width', `${colW}px`, 'important');
+        g.col.style.setProperty('min-width', '0', 'important');
+        g.col.style.setProperty('max-width', `${colW}px`, 'important');
+        g.col.style.setProperty('flex', '0 0 auto', 'important');
+      g.col.style.setProperty('margin-right', `${Math.round(width)}px`, 'important');
+      }
+      post({ type: 'dock-geometry', geom: { rightLeft: g.rightLeft, colLeft: g.colLeft, top: g.top, bottom: g.bottom, width, hasCol: Boolean(g.col) } });
+    }
+  }
+  let frameText = '';
+  function allowedMessageOrigins() {
+    const set = allowedFrameOrigins();
+    set.add(TOP_ORIGIN); // the viewer frame shares the SDx origin
+    return set;
+  }
+  function allowedFrameOrigins() {
+    // Only the known extension frame origin is trusted (a link's own
+    // apiParam1 value is attacker-controllable, so it is not used).
+    return new Set([FRAME_ORIGIN]);
+  }
+  // State reported by the companion instance inside the extension frame.
+  let frameStatusAt = 0;
+  let frameDiag = null;
+  let viewerStatusAt = 0;
+  let pdftronUrl = '';
+  let pdftronWindow = null;
+  let activeTab = '';
+  let overlayOpen = false;
+  let dockTabKey = '';
+  let dockReopening = false;
+  const dockStates = new Map();
+  let dockMode = 'none';
+  let dockNote = '';
+  let dockSyncOn = true;
+  let dockIgnoreUntil = 0;
+  let dockScrollEl = null;
+  let dockTimers = [];
+  let viewerLauncherRect = null;
+  let qarcViewerRect = null;
+  let viewerDiag = null;
+  let frameDockGeom = null;
+  function findQarcFrame() {
+    const allowed = allowedFrameOrigins();
+    for (const f of document.querySelectorAll('iframe')) {
+      try {
+        if (allowed.has(new URL(f.src, window.location.href).origin)) return f;
+      } catch { /* ignore */ }
+    }
+    return null;
+  }
+  function frameModeActive() {
+    return Date.now() - frameStatusAt < 5000 && Boolean(findQarcFrame());
+  }
+  function postToFrame(msg) {
+    const f = findQarcFrame();
+    if (!f || !f.contentWindow) return;
+    try {
+      f.contentWindow.postMessage(Object.assign({ prevsub: true }, msg), new URL(f.src, window.location.href).origin);
+    } catch { /* ignore */ }
+  }
+  // Absolute (top-window) rectangle of the launcher button inside the
+  // viewer frame: qarc frame position + viewer frame position inside it
+  // + button position inside the viewer frame.
+  function placedLauncherRect() {
+    if (Date.now() - viewerStatusAt > 5000 || !viewerLauncherRect || !qarcViewerRect) return null;
+    const f = findQarcFrame();
+    if (!f) return null;
+    const fr = f.getBoundingClientRect();
+    const v = qarcViewerRect;
+    const l = viewerLauncherRect;
+    return [fr.left + v[0] + l[0], fr.top + v[1] + l[1], fr.left + v[0] + l[2], fr.top + v[1] + l[3]];
+  }
+  const isRect = r => Array.isArray(r) && r.length === 4 && r.every(Number.isFinite);
+  window.addEventListener('message', e => {
+    if (!allowedMessageOrigins().has(e.origin)) return;
+    const d = e.data;
+    if (!d || typeof d.type !== 'string') return;
+    if (d.type === 'sdx-prevsub-frame-text' && typeof d.text === 'string') {
+      if (e.origin !== TOP_ORIGIN) frameText = d.text.slice(0, 20000);
+      return;
+    }
+    if (d.prevsub !== true) return;
+    const fromViewer = d.from === 'viewer';
+    if (d.type === 'tabstate' && !fromViewer && e.origin !== TOP_ORIGIN) {
+      activeTab = typeof d.activeTab === 'string' ? d.activeTab : '';
+      overlayOpen = Boolean(d.overlay);
+      return;
+    }
+    const staleTab = fromViewer && Boolean(activeTab) && Boolean(d.tab) && d.tab !== activeTab;
+    if (fromViewer && d.type !== 'status' && staleTab) return;
+    if (d.type === 'status') {
+      const diag = (() => { try { return d.diag ? JSON.parse(JSON.stringify(d.diag)) : null; } catch { return null; } })();
+      if (fromViewer && staleTab) {
+        /* background tab: ignore its toolbar report */
+      } else if (fromViewer) {
+        viewerStatusAt = Date.now();
+        viewerLauncherRect = d.present && isRect(d.rect) ? d.rect : null;
+        try {
+          const abs = placedLauncherRect();
+          if (abs && viewerLauncherRect && isRect(d.ribbon)) {
+            const dy = abs[1] - viewerLauncherRect[1];
+            const nr = [d.ribbon[1] + dy, d.ribbon[3] + dy];
+            if (!ribbonAbs || ribbonAbs[0] !== nr[0] || ribbonAbs[1] !== nr[1]) { ribbonAbs = nr; applyDockHeights(); }
+          }
+        } catch { /* ignore */ }
+        viewerDiag = diag;
+      } else if (e.origin !== TOP_ORIGIN) {
+        frameStatusAt = Date.now();
+        frameDiag = diag;
+        qarcViewerRect = isRect(d.viewerFrameRect) ? d.viewerFrameRect : null;
+      } else {
+        return;
+      }
+      try { e.source.postMessage({ prevsub: true, type: 'state', show: shouldShowHelper() }, e.origin); } catch { /* ignore */ }
+    } else if (d.type === 'viewer-url' && fromViewer) {
+      if (typeof d.url === 'string' && d.url.startsWith(`${TOP_ORIGIN}/enr01/viewers/pdftron/`)) {
+        pdftronUrl = d.url.slice(0, 6000);
+        pdftronWindow = e.source;
+      }
+    } else if (d.type === 'scroll' && fromViewer) {
+      pdftronWindow = e.source;
+      if (Number.isFinite(d.f)) onMainScroll(d.f, d.p, d.pf);
+    } else if (d.type === 'zoom' && fromViewer) {
+      pdftronWindow = e.source;
+      if (Number.isFinite(d.z) && d.z > 0) { lastMainZoom = d.z; lastZoomSrc = String(d.src || ''); if (dockSyncOn && dockSetScale) dockSetScale(d.z); }
+    } else if (d.type === 'zoom-diag' && fromViewer) {
+      lastZoomSrc = `none: ${String(d.diag || '').slice(0, 160)}`;
+    } else if (d.type === 'launcher-press') {
+      launcherPressedAt = Date.now();
+    } else if (d.type === 'toggle-panel' && fromViewer) {
+      launcherPressedAt = Date.now();
+      if (isRect(d.rect)) { viewerLauncherRect = d.rect; viewerStatusAt = Date.now(); }
+      createUi();
+      togglePanel();
+    } else if (d.type === 'dock-geometry' && d.geom && typeof d.geom === 'object' && e.origin !== TOP_ORIGIN) {
+      const g = d.geom;
+      if (![g.rightLeft, g.top, g.bottom, g.width].every(Number.isFinite)) return;
+      frameDockGeom = g;
+      placeDockFromFrameGeom();
+    }
+  });
+  function placeDockFromFrameGeom() {
+    const dock = document.querySelector('#sdx-prevsub-dock');
+    const f = findQarcFrame();
+    const g = frameDockGeom;
+    if (!dock || !f || !g) return;
+    const fr = f.getBoundingClientRect();
+    dock.style.right = 'auto';
+    dock.style.bottom = 'auto';
+    dock.style.left = `${Math.round(fr.left + g.rightLeft - g.width)}px`;
+    dock.style.top = `${Math.round(fr.top + g.top)}px`;
+    dock.style.width = `${Math.round(g.width)}px`;
+    dock.style.height = `${Math.max(200, Math.round(g.bottom - g.top))}px`;
+  }
+  function requestFrameLayout(width, fresh) {
+    postToFrame({
+      type: 'dock-layout',
+      width: width || 0,
+      fresh: Boolean(fresh),
+      rightOffset: USER_SETTINGS.dockRightOffsetPx
+    });
+  }
+  function isOwnUi(el) {
+    return el.id === 'sdx-prevsub-panel' || el.id === 'sdx-prevsub-dock' ||
+      el.id === 'sdx-prevsub-scroll-top' || el.id === LAUNCHER_ID;
+  }
+  function inspectElementDeep(el, out) {
+    if (el.shadowRoot) out.push(el.shadowRoot.textContent || '');
+    if (el.tagName === 'IFRAME') {
+      try {
+        const doc = el.contentDocument;
+        if (doc && doc.body) out.push(doc.body.innerText || '');
+      } catch { /* cross-origin */ }
+    }
+  }
+  function collectShadowText(root, out, depth) {
+    if (depth > 6 || out.length > 200) return;
+    inspectElementDeep(root, out);
+    root.querySelectorAll('*').forEach(el => {
+      inspectElementDeep(el, out);
+      if (el.shadowRoot) collectShadowText(el.shadowRoot, out, depth + 1);
+    });
+  }
+  let lastDetectionDebug = {};
+  // Reads page text from everything EXCEPT this script's own UI (its
+  // panel text would otherwise be scraped back in as "document" data).
   function getPageText() {
-    return cleanText(document.body ? document.body.innerText : '');
+    const top = [];
+    const deep = [];
+    if (document.body) {
+      for (const child of document.body.children) {
+        if (isOwnUi(child) || /^(SCRIPT|STYLE)$/.test(child.tagName)) continue;
+        top.push(child.innerText || '');
+        try { collectShadowText(child, deep, 0); } catch { /* ignore */ }
+      }
+    }
+    const topText = top.join(' ');
+    const deepText = deep.join(' ');
+    const has = t => /SDx Name:/i.test(t);
+    lastDetectionDebug = {
+      topTextLength: topText.length,
+      shadowOrSameOriginFrameTextLength: deepText.length,
+      crossOriginFrameTextLength: frameText.length,
+      summaryFoundIn: has(topText) ? 'page' : has(deepText) ? 'shadow/same-origin frame' : has(frameText) ? 'extension frame' : 'nowhere',
+      frameTextSample: cleanText(frameText).slice(0, 300)
+    };
+    return cleanText([topText, deepText, frameText].join(' ')).slice(0, 300000);
+  }
+  // Only https links are ever opened or fetched.
+  function isHttpsUrl(url) {
+    try { return new URL(String(url), window.location.href).protocol === 'https:'; } catch { return false; }
   }
   function openTab(url) {
+    if (url && !isHttpsUrl(url)) {
+      setStatus('<span class="sdx-prevsub-bad">Blocked a non-https link.</span>');
+      return;
+    }
     if (!url) {
       setStatus('<span class="sdx-prevsub-bad">No URL was available for that result.</span>');
       return;
@@ -1023,9 +1503,128 @@
     setTimeout(refreshPanel, 350);
     setTimeout(refreshPanel, 1200);
   }
+  // Launcher placement. The Bluebeam toolbar row lives inside the
+  // pdftron viewer iframe (same-origin), so look there - same approach
+  // the Bluebeam userscript uses for its own buttons.
+  const LAUNCHER_ID = 'sdx-prevsub-btn';
+  let launcherTicks = 0;
+  let launcherPressedAt = 0;
+  let launcherTimer = null;
+  // Depth-first search through this document and every reachable
+  // (same-origin) nested iframe document. fn(doc, depth) returns a
+  // truthy value to stop.
+  function walkDocs(doc, fn, depth) {
+    if (!doc || depth > 6) return null;
+    let hit = null;
+    try { hit = fn(doc, depth); } catch { hit = null; }
+    if (hit) return hit;
+    let frames = [];
+    try { frames = Array.from(doc.querySelectorAll('iframe')); } catch { frames = []; }
+    for (const f of frames) {
+      let child = null;
+      try { child = f.contentDocument; } catch { child = null; }
+      const r = walkDocs(child, fn, depth + 1);
+      if (r) return r;
+    }
+    return null;
+  }
+  function findToolbarContainer() {
+    return walkDocs(document, d => d.querySelector('.custom-ribbons-container'), 0);
+  }
+  // Cumulative offset of an element's document inside the top window.
+  function getTopOffset(el) {
+    let left = 0;
+    let top = 0;
+    try {
+      let win = el.ownerDocument.defaultView;
+      while (win && win !== window && win.frameElement) {
+        const r = win.frameElement.getBoundingClientRect();
+        left += r.left;
+        top += r.top;
+        win = win.parent;
+      }
+    } catch { /* cross-origin: stop */ }
+    return { left, top };
+  }
+  function buildLauncher(doc, inRibbon, handlers) {
+    const b = doc.createElement('button');
+    b.type = 'button';
+    b.id = LAUNCHER_ID;
+    b.textContent = 'Prev Doc Ver';
+    b.title = 'Find previous versions / consolidated renditions of this document';
+    if (inRibbon) {
+      b.style.cssText = 'height:28px;padding:0 12px;margin:0 10px 0 0;border-radius:14px;border:1px solid #6546b5;background:#6c4bd3;color:#fff;font:700 12px "Segoe UI",Arial,sans-serif;cursor:pointer;white-space:nowrap;flex:0 0 auto;';
+    }
+    const h = handlers || {};
+    b.addEventListener('mousedown', h.press || (() => { launcherPressedAt = Date.now(); }));
+    b.addEventListener('click', h.click || togglePanel);
+    return b;
+  }
+  function getRibbonLauncher() {
+    const c = findToolbarContainer();
+    return c ? c.querySelector('#' + LAUNCHER_ID) : null;
+  }
+  function removeLaunchers() {
+    document.getElementById(LAUNCHER_ID)?.remove();
+    getRibbonLauncher()?.remove();
+  }
+  function ensureLauncher() {
+    if (!shouldShowHelper()) return;
+    // The companion inside the extension frame owns the toolbar button.
+    if (placedLauncherRect()) {
+      launcherTicks = 0;
+      document.getElementById(LAUNCHER_ID)?.remove();
+      return;
+    }
+    const container = findToolbarContainer();
+    if (container) {
+      launcherTicks = 0;
+      document.getElementById(LAUNCHER_ID)?.remove();
+      if (!container.querySelector('#' + LAUNCHER_ID)) {
+        container.appendChild(buildLauncher(container.ownerDocument, true));
+      }
+      return;
+    }
+    if (++launcherTicks < 12) return;
+    if (!document.getElementById(LAUNCHER_ID) && document.body) {
+      document.body.appendChild(buildLauncher(document, false));
+    }
+  }
+  function startLauncherLoop() {
+    if (launcherTimer) return;
+    launcherTimer = setInterval(ensureLauncher, 1000);
+    ensureLauncher();
+  }
+  function positionPanel() {
+    const panel = document.querySelector('#sdx-prevsub-panel');
+    if (!panel) return;
+    const el = getRibbonLauncher();
+    const abs = placedLauncherRect();
+    if (abs) {
+      const top = Math.round(abs[3] + 6);
+      panel.style.top = `${top}px`;
+      panel.style.bottom = 'auto';
+      panel.style.right = `${Math.max(12, Math.round(window.innerWidth - abs[2]))}px`;
+      panel.style.maxHeight = `${Math.max(240, window.innerHeight - top - 16)}px`;
+    } else if (el) {
+      const r = el.getBoundingClientRect();
+      const off = getTopOffset(el);
+      const top = Math.round(off.top + r.bottom + 6);
+      panel.style.top = `${top}px`;
+      panel.style.bottom = 'auto';
+      panel.style.right = `${Math.max(12, Math.round(window.innerWidth - (off.left + r.right)))}px`;
+      panel.style.maxHeight = `${Math.max(240, window.innerHeight - top - 16)}px`;
+    } else {
+      panel.style.top = '';
+      panel.style.bottom = '';
+      panel.style.right = '';
+      panel.style.maxHeight = '';
+    }
+  }
   function openPanel() {
     const panel = document.querySelector('#sdx-prevsub-panel');
     if (!panel) return;
+    positionPanel();
     panel.style.display = 'block';
     reopenPanelDetection();
     scheduleAutoClose();
@@ -1070,10 +1669,11 @@
       setTimeout(() => {
         const panel = document.querySelector('#sdx-prevsub-panel');
         if (!panel || panel.style.display !== 'block') return;
+        if (Date.now() - launcherPressedAt < 800) return; // click on our own toolbar button
         if (document.activeElement && document.activeElement.tagName === 'IFRAME') {
           closePanel();
         }
-      }, 0);
+      }, 150);
     });
   }
   /********************************************************************
@@ -1111,9 +1711,74 @@
     tail = tail.replace(/\bEmbedded Comments\b.*$/i, '');
     return cleanText(tail).slice(0, 180);
   }
+  // Fallback for pages whose content isn't readable from this document
+  // (e.g. rendered in a cross-origin frame): look the document up from
+  // the ContextObjectOBIDs in the route.
+  let contextDetected = null;
+  let contextFetchedFor = '';
+  let contextDebug = {};
+  function getContextObjectObid() {
+    try {
+      const decoded = decodeURIComponent(window.location.href);
+      const m = decoded.match(/ContextObjectOBIDs=(\[[^\]]*\])/i);
+      if (!m) return '';
+      const arr = JSON.parse(m[1]);
+      const first = Array.isArray(arr) ? String(arr[0] || '').trim() : '';
+      return /^[A-Z0-9]{4,20}$/i.test(first) ? first : '';
+    } catch {
+      return '';
+    }
+  }
+  async function fetchContextDocument() {
+    const obid = getContextObjectObid();
+    if (!obid || contextFetchedFor === obid) return false;
+    contextFetchedFor = obid;
+    contextDebug = { obid, status: 'fetching' };
+    try {
+      const url = `${window.location.origin}/ENR01Server/api/v2/SDA/Objects('${encodeURIComponent(obid)}')`;
+      const res = await authorizedRequest(url, { method: 'GET' });
+      const json = await res.json();
+      const obj = (Array.isArray(json && json.value) ? json.value[0] : json) || {};
+      const text = Object.values(obj).filter(v => typeof v === 'string').join(' | ');
+      const docs = extractDocumentNumbers(text);
+      contextDebug = { obid, status: docs.length ? 'ok' : 'no document number found in object', keys: Object.keys(obj).slice(0, 40) };
+      if (!docs.length) return false;
+      contextDetected = {
+        obid,
+        docNo: docs[0],
+        title: cleanText(firstNonEmpty(obj, ['Title', 'Description', 'Name'])),
+        currentRev: cleanText(String(firstNonEmpty(obj, ['Doc_Rev', 'Revision', 'Rev']))),
+        source: 'SDx object lookup (route context OBID)'
+      };
+      return true;
+    } catch (err) {
+      contextDebug = { obid, status: 'error', error: String(err && err.message || err).slice(0, 200) };
+      return false;
+    }
+  }
+  // Parses the reviewer pane's "Document Summary" labels from flattened
+  // page text, e.g. "SDx Name: 123456-1.2345-0001 Document Number:
+  // E17 - MH-03 Title: MH-03 Doc Rev: 1 Date Recived: ...".
+  function parseSummaryLabels(text) {
+    const grab = re => { const m = text.match(re); return m ? cleanText(m[1]) : ''; };
+    return {
+      sdxName: grab(/SDx Name:\s*([A-Za-z0-9._-]+)/i),
+      altDocNo: grab(/Document Number:\s*(.+?)\s+Title:/i).slice(0, 80),
+      title: grab(/\sTitle:\s*(.+?)\s+Doc Rev:/i).slice(0, 180),
+      docRev: grab(/Doc Rev:\s*([A-Za-z0-9]+)/i)
+    };
+  }
   function detectCurrentDocument() {
     const text = getPageText();
     const docs = extractDocumentNumbers(text);
+    if (!docs.length && contextDetected && contextDetected.obid === getContextObjectObid()) {
+      return {
+        docNo: contextDetected.docNo,
+        title: contextDetected.title,
+        currentRev: contextDetected.currentRev,
+        source: contextDetected.source
+      };
+    }
     if (!docs.length) {
       return {
         docNo: '',
@@ -1122,14 +1787,16 @@
         source: 'not detected'
       };
     }
-    const docNo = docs[0];
-    const title = extractTitleNearDoc(text, docNo);
-    const currentRev = extractCurrentRevisionFromPage(text, docNo);
+    const labels = parseSummaryLabels(text);
+    const docNo = (labels.sdxName && docs.includes(labels.sdxName)) ? labels.sdxName : docs[0];
+    const title = labels.title || extractTitleNearDoc(text, docNo);
+    const currentRev = labels.docRev || extractCurrentRevisionFromPage(text, docNo);
     return {
       docNo,
+      altDocNo: labels.altDocNo,
       title,
       currentRev,
-      source: 'current tab viewAndMarkup page'
+      source: labels.sdxName ? `review page Document Summary (${lastDetectionDebug.summaryFoundIn})` : 'current tab review page'
     };
   }
   /********************************************************************
@@ -1177,6 +1844,7 @@
     const { project, pkg, seq } = getDocNumberParts(docNo);
     const tokens = tokenizeTitle(cleanedTitle);
     const queries = [
+      detected.altDocNo || '',
       cleanedTitle,
       titleNoPunctuation,
       docNo,
@@ -1202,12 +1870,13 @@
     const { project, pkg, seq } = getDocNumberParts(docNo);
     const candidates = [
       docNo,
+      detected.altDocNo || '',
       pkg && seq ? `${pkg}-${seq}` : '',
       project && pkg ? `${project}-${pkg}` : '',
       seq,
       pkg
     ];
-    return unique(candidates).slice(0, 5);
+    return unique(candidates).slice(0, 6);
   }
   /********************************************************************
    * SDx API SEARCH
@@ -1231,6 +1900,11 @@
   function root(entityType) {
     return `${window.location.origin}/ENR01Server/api/v2/SDA/${entityType}`;
   }
+  // Project scoping headers (sent only when the project was detected).
+  function projectHeaders() {
+    const uid = SETTINGS.projectConfigUid;
+    return uid ? { spfconfiguid: uid, spfcreateconfiguid: uid, spfqueryconfiguid: uid } : {};
+  }
   async function apiSearch(searchText, entityType, retryState, fields) {
     const attempt = (retryState && retryState.attempt) || 1;
     const url = buildApiUrl(searchText, entityType, fields);
@@ -1248,12 +1922,7 @@
         accept: 'application/json, text/javascript, */*; q=0.01',
         authorization: authorization,
         'x-requested-with': 'XMLHttpRequest',
-        spfconfiguid: SETTINGS.projectConfigUid,
-        // Defensive extras: a sibling SDx script found the server keys
-        // project scoping off these header names on some endpoints.
-        // Harmless to include here even if this endpoint ignores them.
-        spfcreateconfiguid: SETTINGS.projectConfigUid,
-        spfqueryconfiguid: SETTINGS.projectConfigUid
+        ...projectHeaders()
       }
     });
     if (res.status === 401 || res.status === 403) {
@@ -1295,9 +1964,7 @@
         accept: 'application/json, text/javascript, */*; q=0.01',
         authorization,
         'x-requested-with': 'XMLHttpRequest',
-        spfconfiguid: SETTINGS.projectConfigUid,
-        spfcreateconfiguid: SETTINGS.projectConfigUid,
-        spfqueryconfiguid: SETTINGS.projectConfigUid
+        ...projectHeaders()
       },
       (options && options.headers) || {}
     );
@@ -1376,6 +2043,701 @@
       }
     }
   }
+
+  /********************************************************************
+   * SIDE-BY-SIDE DOCK
+   *
+   * Overlays the consolidated PDF on the viewer area while leaving the
+   * right-hand comments / reviewer-actions pane uncovered.
+   ********************************************************************/
+  const DOCK_WIDTH_KEY = 'sdx-prevsub-dock-width-v1';
+  let dockBlobUrl = '';
+  let dockCurrentUri = '';
+  function findRightPaneRect() {
+    // 1) an extension frame hugging the right window edge
+    for (const f of document.querySelectorAll('iframe')) {
+      if (f.closest('#sdx-prevsub-dock')) continue;
+      const r = f.getBoundingClientRect();
+      if (r.right >= window.innerWidth - 6 && r.width >= 220 && r.width <= window.innerWidth * 0.45 && r.height >= window.innerHeight * 0.5) return r;
+    }
+    // 2) by well-known text, climbing to the widest ancestor on the right edge
+    try {
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      let node;
+      while ((node = walker.nextNode())) {
+        const t = node.nodeValue || '';
+        if (!/Document Summary|Return Code|Review Comments/.test(t)) continue;
+        let el = node.parentElement;
+        if (el && el.closest('#sdx-prevsub-panel, #sdx-prevsub-dock')) continue;
+        let best = null;
+        for (let i = 0; el && i < 14; i++, el = el.parentElement) {
+          const r = el.getBoundingClientRect();
+          if (r.right >= window.innerWidth - 6 && r.width >= 220 && r.width <= window.innerWidth * 0.45 && r.height >= window.innerHeight * 0.5) best = r;
+        }
+        if (best) return best;
+      }
+    } catch { /* fall through to defaults */ }
+    return null;
+  }
+  // The viewer column = topmost ancestor of the pdftron viewer(s) that
+  // stops at the left edge of the right-hand pane.
+  // Elements in the TOP document that contain the PDF viewer: either a
+  // pdftron iframe directly, or any iframe (however deep) that holds one.
+  const isViewerFrameEl = f => /viewAndMarkup/i.test(f.getAttribute('src') || '') || /^viewer-frame/i.test(f.id);
+  // With several review tabs open there are several viewer frames; the
+  // active one is the visible one that is on top at its own center.
+  function findViewerFrameEl() {
+    const all = Array.from(document.querySelectorAll('iframe')).filter(f => !f.closest('#sdx-prevsub-dock') && isViewerFrameEl(f));
+    const vis = all.filter(f => {
+      try {
+        const r = f.getBoundingClientRect();
+        if (r.width < 100 || r.height < 100) return false;
+        const cs = getComputedStyle(f);
+        return cs.visibility !== 'hidden' && cs.display !== 'none' && cs.opacity !== '0';
+      } catch { return false; }
+    });
+    const onTop = vis.filter(f => {
+      try {
+        const r = f.getBoundingClientRect();
+        return document.elementFromPoint(r.left + r.width / 2, r.top + Math.min(r.height / 2, 200)) === f;
+      } catch { return false; }
+    });
+    return onTop[0] || vis[0] || all[0] || null;
+  }
+  function addDocumentOpen() {
+    try {
+      for (const el of document.querySelectorAll('h1,h2,h3,h4,h5,h6,div,span,p,label')) {
+        if (el.children.length > 0) continue;
+        if ((el.textContent || '').trim() !== 'Add Document') continue;
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0 && r.right > 0 && r.left < window.innerWidth) {
+          const cs = getComputedStyle(el);
+          if (cs.visibility !== 'hidden' && cs.display !== 'none') return true;
+        }
+      }
+    } catch { /* ignore */ }
+    return false;
+  }
+  const tabKeyOfFrame = f => (f && /^viewer-frame-(.+)$/i.exec(f.id || '') || [])[1] || '';
+  function findViewerRoots() {
+    const roots = [];
+    const activeViewerFrame = findViewerFrameEl();
+    for (const f of document.querySelectorAll('iframe')) {
+      if (f.closest('#sdx-prevsub-dock')) continue;
+      if (/pdftron|viewAndMarkup/i.test(f.getAttribute('src') || '') || /^viewer-frame/i.test(f.id)) {
+        if (isViewerFrameEl(f) && activeViewerFrame && f !== activeViewerFrame) continue;   // background tab
+        roots.push(f);
+        continue;
+      }
+      let child = null;
+      try { child = f.contentDocument; } catch { child = null; }
+      if (child && walkDocs(child, d => d.querySelector('iframe[src*="pdftron" i], .custom-ribbons-container'), 0)) roots.push(f);
+    }
+    return roots;
+  }
+  function findViewerColumn(rightLeft) {
+    for (const root of findViewerRoots()) {
+      let el = root;
+      while (el && el !== document.body && el !== document.documentElement) {
+        const p = el.parentElement;
+        const r = el.getBoundingClientRect();
+        if (p && r.width >= 300 && Math.abs(r.right - rightLeft) <= 16 && p.getBoundingClientRect().right >= window.innerWidth - 6) return el;
+        el = p;
+      }
+    }
+    return null;
+  }
+  function describeFrames(doc, depth) {
+    const out = [];
+    if (!doc || depth > 6) return out;
+    let frames = [];
+    try { frames = Array.from(doc.querySelectorAll('iframe')); } catch { return out; }
+    for (const f of frames) {
+      let child = null;
+      try { child = f.contentDocument; } catch { child = null; }
+      const r = f.getBoundingClientRect();
+      out.push({
+        depth,
+        src: (f.getAttribute('src') || '').slice(0, 500),
+        globals: (() => { try { return Object.keys(f.contentWindow).filter(k => /webviewer|instance|^Core$|PDFNet|readerControl|documentViewer|annotManager/i.test(k)).slice(0, 20); } catch { return null; } })(),
+        id: f.id || '',
+        sameOrigin: Boolean(child),
+        rect: [Math.round(r.left), Math.round(r.top), Math.round(r.right), Math.round(r.bottom)],
+        hasRibbon: Boolean(child && child.querySelector('.custom-ribbons-container'))
+      });
+      if (child) out.push(...describeFrames(child, depth + 1));
+    }
+    return out;
+  }
+  function describeLayout() {
+    const rect = findRightPaneRect();
+    const rightLeft = rect ? Math.round(rect.left) : null;
+    const col = rightLeft ? findViewerColumn(rightLeft) : null;
+    return {
+      toolbarFound: Boolean(findToolbarContainer()),
+      rightPaneLeft: rightLeft,
+      viewerRoots: findViewerRoots().length,
+      column: col ? `${col.tagName.toLowerCase()}#${col.id}.${String(col.className || '').slice(0, 60)}` : null,
+      frames: describeFrames(document, 0)
+    };
+  }
+  let dockGeom = null;   // { col, saved, rightLeft, colLeft, top, bottom }
+  const COL_PROPS = ['width', 'min-width', 'max-width', 'flex', 'margin-right'];
+  function restoreViewerColumn() {
+    if (!dockGeom || !dockGeom.col) return;
+    for (const prop of COL_PROPS) {
+      const v = dockGeom.saved[prop];
+      if (v && v.value) dockGeom.col.style.setProperty(prop, v.value, v.priority);
+      else dockGeom.col.style.removeProperty(prop);
+    }
+  }
+  function applyDockWidth(requested) {
+    const dock = document.querySelector('#sdx-prevsub-dock');
+    if (!dock || !dockGeom) return;
+    const g = dockGeom;
+    const available = Math.max(400, g.rightLeft - g.colLeft);
+    const width = Math.min(Math.max(280, requested), available - 300);
+    dock.style.width = `${width}px`;
+    if (g.col) {
+      const colW = Math.round(available - width);
+      g.col.style.setProperty('width', `${colW}px`, 'important');
+      g.col.style.setProperty('min-width', '0', 'important');
+      g.col.style.setProperty('max-width', `${colW}px`, 'important');
+      g.col.style.setProperty('flex', '0 0 auto', 'important');
+      g.col.style.setProperty('margin-right', `${Math.round(width)}px`, 'important');
+    }
+  }
+  function layoutDock() {
+    const dock = document.querySelector('#sdx-prevsub-dock');
+    if (!dock) return;
+    if (frameModeActive()) {
+      let w = 0;
+      try { w = Number(localStorage.getItem(DOCK_WIDTH_KEY)) || 0; } catch { /* ignore */ }
+      requestFrameLayout(w, true);
+      return;
+    }
+    restoreViewerColumn();
+    const rect = findRightPaneRect();
+    const override = USER_SETTINGS.dockRightOffsetPx;
+    const rightOffset = override > 0 ? override : (rect ? Math.round(rect.width) : 380);
+    const rightLeft = window.innerWidth - rightOffset;
+    const col = findViewerColumn(rightLeft);
+    const cr = col ? col.getBoundingClientRect() : null;
+    const saved = {};
+    if (col) {
+      for (const prop of COL_PROPS) saved[prop] = { value: col.style.getPropertyValue(prop), priority: col.style.getPropertyPriority(prop) };
+    }
+    const top = cr ? Math.round(cr.top) : (rect ? Math.max(0, Math.round(rect.top)) : 48);
+    const bottom = cr ? Math.max(0, Math.round(window.innerHeight - cr.bottom)) : 0;
+    dockGeom = { col, saved, rightLeft, colLeft: cr ? Math.round(cr.left) : 0, top, bottom };
+    dock.style.top = `${top}px`;
+    dock.style.bottom = `${bottom}px`;
+    dock.style.right = `${rightOffset}px`;
+    let width = 0;
+    try { width = Number(localStorage.getItem(DOCK_WIDTH_KEY)) || 0; } catch { /* ignore */ }
+    if (!width) width = Math.round((rightLeft - dockGeom.colLeft) * 0.5);
+    applyDockWidth(width);
+  }
+  function applyDockHeights() {
+    try {
+      const dock = document.querySelector('#sdx-prevsub-dock');
+      if (!dock || !ribbonAbs) return;
+      const top = dock.getBoundingClientRect().top;
+      const header = Math.round(ribbonAbs[0] - top);
+      const tool = Math.round(ribbonAbs[1] - ribbonAbs[0]);
+      const bar = dock.querySelector('.sdx-prevsub-dock-bar');
+      if (bar && header >= 20 && header <= 80) { bar.style.height = `${header}px`; bar.style.boxSizing = 'border-box'; bar.style.paddingTop = '0'; bar.style.paddingBottom = '0'; }
+      const pb = document.querySelector('#sdx-prevsub-pdf-toolbar');
+      if (pb && tool >= 24 && tool <= 80) { pb.style.height = `${tool}px`; pb.style.boxSizing = 'border-box'; pb.style.paddingTop = '0'; pb.style.paddingBottom = '0'; }
+    } catch { /* ignore */ }
+  }
+  function closeDock() {
+    clearDockTimers();
+    if (dockViewerDestroy) { try { dockViewerDestroy(); } catch { /* ignore */ } dockViewerDestroy = null; }
+    dockMode = 'none';
+    dockScrollEl = null;
+    if (frameModeActive()) postToFrame({ type: 'dock-restore' });
+    frameDockGeom = null;
+    restoreViewerColumn();
+    dockGeom = null;
+    document.querySelector('#sdx-prevsub-dock')?.remove();
+    if (dockBlobUrl) {
+      try { URL.revokeObjectURL(dockBlobUrl); } catch { /* ignore */ }
+      dockBlobUrl = '';
+    }
+    dockCurrentUri = '';
+  }
+  function popOutTiled(uri) {
+    if (!isHttpsUrl(uri)) return;
+    const w = Math.round(screen.availWidth / 2);
+    const h = screen.availHeight;
+    const left = (window.screenX || 0) >= screen.availWidth / 2 ? 0 : Math.round(screen.availWidth / 2);
+    window.open(uri, 'sdxConsolidatedPdf', `popup=yes,width=${w},height=${h},left=${left},top=0,noopener,noreferrer`);
+  }
+  function ensureDock() {
+    let dock = document.querySelector('#sdx-prevsub-dock');
+    if (dock) return dock;
+    dock = document.createElement('div');
+    dock.id = 'sdx-prevsub-dock';
+    const handle = document.createElement('div');
+    handle.className = 'sdx-prevsub-dock-handle';
+    handle.title = 'Drag to resize';
+    const bar = document.createElement('div');
+    bar.className = 'sdx-prevsub-dock-bar';
+    const label = document.createElement('span');
+    label.id = 'sdx-prevsub-dock-label';
+    const mk = (text, title, fn) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = text;
+      b.title = title;
+      b.addEventListener('click', fn);
+      return b;
+    };
+    bar.append(
+      label,
+      (() => {
+        const b = mk('Sync scroll: on', 'Scroll the review document and this PDF together', () => {
+          dockSyncOn = !dockSyncOn;
+          updateSyncButton();
+          if (dockSyncOn && dockSetScale && lastMainZoom > 0) dockSetScale(lastMainZoom);
+        });
+        b.id = 'sdx-prevsub-dock-sync';
+        b.style.display = 'none';
+        return b;
+      })(),
+      mk('Download', 'Save this PDF', () => {
+        try {
+          if (!dockBuffer) { openTab(dockCurrentUri); return; }
+          const url = URL.createObjectURL(new Blob([dockBuffer], { type: 'application/pdf' }));
+          const a = document.createElement('a');
+          const base = String(document.querySelector('#sdx-prevsub-dock-label')?.textContent || 'consolidated').replace(/[\\/:*?"<>|]+/g, '_').trim() || 'consolidated';
+          a.href = url;
+          a.download = /\.pdf$/i.test(base) ? base : `${base}.pdf`;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          setTimeout(() => URL.revokeObjectURL(url), 10000);
+        } catch { openTab(dockCurrentUri); }
+      }),
+      mk('Open in tab', 'Open this PDF in a new browser tab', () => openTab(dockCurrentUri)),
+      mk('Tiled window', 'Open in its own window on the other half of the screen', () => popOutTiled(dockCurrentUri)),
+      (() => {
+        const b = mk('\u00d7', 'Close side-by-side view', () => { dockStates.delete(dockTabKey); closeDock(); });
+        b.style.cssText = 'background:#c62828;border-color:#b71c1c;color:#fff;min-width:44px;font-weight:700;font-size:14px;line-height:1;';
+        return b;
+      })()
+    );
+    const body = document.createElement('div');
+    body.id = 'sdx-prevsub-dock-body';
+    dock.append(handle, bar, body);
+    document.body.appendChild(dock);
+    handle.addEventListener('mousedown', e => {
+      e.preventDefault();
+      const frames = Array.from(document.querySelectorAll('iframe'));
+      frames.forEach(f => { f.style.pointerEvents = 'none'; });
+      const onMove = ev => {
+        if (frameModeActive() && frameDockGeom) {
+          const fr = findQarcFrame().getBoundingClientRect();
+          requestFrameLayout((fr.left + frameDockGeom.rightLeft) - ev.clientX, false);
+        } else {
+          const rightOffset = parseInt(dock.style.right, 10) || 0;
+          applyDockWidth(window.innerWidth - rightOffset - ev.clientX);
+        }
+      };
+      const onUp = () => {
+        document.removeEventListener('mousemove', onMove, true);
+        document.removeEventListener('mouseup', onUp, true);
+        frames.forEach(f => { f.style.pointerEvents = ''; });
+        try { localStorage.setItem(DOCK_WIDTH_KEY, String(parseInt(dock.style.width, 10) || 0)); } catch { /* ignore */ }
+        if (frameModeActive()) requestFrameLayout(parseInt(dock.style.width, 10) || 0, false);
+      };
+      document.addEventListener('mousemove', onMove, true);
+      document.addEventListener('mouseup', onUp, true);
+    });
+    return dock;
+  }
+  // --- Side-by-side viewer (PDF.js) ------------------------------------
+  let dockViewerDestroy = null;
+  let dockCommentCount = 0;
+  let pdfjsRef = null;
+  function clearDockTimers() {
+    dockTimers.forEach(t => clearInterval(t));
+    dockTimers = [];
+  }
+  function postToViewer(msg) {
+    if (!pdftronWindow) return;
+    try { pdftronWindow.postMessage(Object.assign({ prevsub: true }, msg), TOP_ORIGIN); } catch { /* ignore */ }
+  }
+  function dockPages() {
+    return dockScrollEl ? Array.from(dockScrollEl.querySelectorAll('[data-page]')) : [];
+  }
+  function onMainScroll(f, p, pf) {
+    if (!dockSyncOn || dockMode !== 'pdfjs' || !dockScrollEl) return;
+    dockIgnoreUntil = Date.now() + 250;
+    const pgs = Number.isFinite(p) ? dockPages() : [];
+    if (!(pgs.length && setPageAnchor(dockScrollEl, pgs, p, Number.isFinite(pf) ? pf : 0))) setScrollFraction(dockScrollEl, f);
+  }
+  function hookDockScroll(el) {
+    dockScrollEl = el;
+    let raf = 0;
+    el.addEventListener('scroll', () => {
+      if (!dockSyncOn || Date.now() < dockIgnoreUntil || raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        const a = pageAnchor(el, dockPages());
+        postToViewer({ type: 'scroll-set', f: getScrollFraction(el), p: a ? a.p : undefined, pf: a ? a.pf : undefined });
+      });
+    }, { passive: true });
+  }
+  function updateSyncButton() {
+    const b = document.querySelector('#sdx-prevsub-dock-sync');
+    if (!b) return;
+    b.style.display = dockMode === 'pdfjs' ? '' : 'none';
+    b.textContent = dockSyncOn ? 'Sync scroll: on' : 'Sync scroll: off';
+  }
+  // PDF.js is kept as Tampermonkey @resource text (integrity-checked) and
+  // evaluated only here, in the top page, on first use.
+  let pdfjsNote = '';
+  let pdfjsStage = '';
+  function withTimeout(promise, ms, label) {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`)), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+  }
+  // PDF.js 3.11.174: the last release shipped as a classic script.
+  function loadPdfjsClassic() {
+    if (typeof GM_getResourceText !== 'function') throw new Error('Tampermonkey resource API unavailable');
+    const libText = GM_getResourceText('pdfjsLib');
+    const workerText = GM_getResourceText('pdfjsWorker');
+    if (!libText || !workerText) {
+      throw new Error('PDF.js was not downloaded by Tampermonkey (it needs access to cdn.jsdelivr.net when the script is installed) - reinstall the script');
+    }
+    const libMod = { exports: {} };
+    new Function('module', 'exports', libText)(libMod, libMod.exports);
+    const lib = libMod.exports;
+    if (!lib || typeof lib.getDocument !== 'function') throw new Error('PDF.js did not initialize');
+    const workerMod = { exports: {} };
+    new Function('module', 'exports', workerText)(workerMod, workerMod.exports);
+    if (!workerMod.exports || !workerMod.exports.WorkerMessageHandler) throw new Error('PDF.js worker did not initialize');
+    globalThis.pdfjsWorker = { WorkerMessageHandler: workerMod.exports.WorkerMessageHandler };
+    lib.GlobalWorkerOptions.workerSrc = 'pdf.worker.js';
+    return lib;
+  }
+  function loadPdfjs() {
+    if (!pdfjsRef) {
+      pdfjsRef = loadPdfjsClassic();
+      pdfjsNote = `PDF.js ${pdfjsRef.version || '3.11.174'}`;
+    }
+    return pdfjsRef;
+  }
+  function parsePdfDate(str) {
+    const m = /^D:(\d{4})(\d{2})?(\d{2})?(\d{2})?(\d{2})?(\d{2})?/.exec(String(str || ''));
+    if (!m) return null;
+    return new Date(Number(m[1]), Number(m[2] || 1) - 1, Number(m[3] || 1), Number(m[4] || 0), Number(m[5] || 0), Number(m[6] || 0));
+  }
+  const COMMENT_SUBTYPES = new Set(['Text', 'FreeText', 'Highlight', 'Underline', 'StrikeOut', 'Squiggly', 'Stamp', 'Ink', 'Line', 'Square', 'Circle', 'Polygon', 'PolyLine', 'Caret', 'FileAttachment']);
+  async function mountPdfViewer(body, buffer, labelText) {
+    const lib = loadPdfjs();
+    pdfjsStage = 'opening PDF';
+    const task = lib.getDocument({
+      data: new Uint8Array(buffer.slice(0)),
+      isEvalSupported: false,      // mitigates CVE-2024-4367
+      enableXfa: false,
+      useSystemFonts: true
+    });
+    let pdf;
+    try {
+      pdf = await withTimeout(task.promise, 30000, 'opening the PDF');
+    } catch (err) {
+      try { task.destroy(); } catch { /* ignore */ }
+      throw err;
+    }
+    const mk = (tag, css, text) => {
+      const el = document.createElement(tag);
+      if (css) el.style.cssText = css;
+      if (text) el.textContent = text;
+      return el;
+    };
+    const btnCss = 'border:1px solid #2d7fb8;background:#fff;color:#2d7fb8;border-radius:4px;font-size:11px;padding:2px 8px;cursor:pointer;';
+    body.textContent = '';
+    const wrap = mk('div', 'display:flex;flex-direction:column;height:100%;');
+    const bar = mk('div', 'display:flex;align-items:center;gap:6px;padding:3px 8px;background:#fafafa;border-bottom:1px solid #e0e0e0;font-size:11px;');
+    bar.id = 'sdx-prevsub-pdf-toolbar';
+    const zoomOut = mk('button', btnCss, '−');
+    const zoomIn = mk('button', btnCss, '+');
+    const fitBtn = mk('button', btnCss, 'Fit width');
+    const zoomLabel = mk('input', 'width:40px !important;min-width:0 !important;flex:0 0 auto !important;text-align:center;font-size:11px;border:1px solid #bbb;border-radius:3px;padding:2px 0 !important;box-sizing:border-box;');
+    zoomLabel.type = 'text';
+    zoomLabel.title = 'Type a zoom percentage and press Enter';
+    const pageLabel = mk('span', 'flex:1;text-align:center;color:#555;');
+    const commentsBtn = mk('button', btnCss, 'Comments');
+    [zoomOut, zoomIn, fitBtn, commentsBtn].forEach(b => { b.type = 'button'; });
+    bar.append(zoomOut, zoomLabel, zoomIn, fitBtn, pageLabel, commentsBtn);
+    const main = mk('div', 'position:relative;flex:1;min-height:0;');
+    const scroller = mk('div', 'position:absolute;top:0;left:0;right:0;bottom:0;overflow:auto;background:#e8e8e8;');
+    const list = mk('div', 'position:absolute;top:0;left:0;right:0;bottom:0;overflow:auto;background:#fff;padding:8px;display:none;z-index:2;font-size:12px;');
+    main.append(scroller, list);
+    wrap.append(bar, main);
+    body.appendChild(wrap);
+    applyDockHeights();
+    const pageDivs = [];
+    const rendered = new Set();
+    const rendering = new Set();
+    let scale = 1;
+    let baseW = 612;
+    let baseH = 792;
+    let destroyed = false;
+    const first = await pdf.getPage(1);
+    const v1 = first.getViewport({ scale: 1 });
+    baseW = v1.width;
+    baseH = v1.height;
+    const dpr = window.devicePixelRatio || 1;
+    const observer = new IntersectionObserver(entries => {
+      entries.forEach(en => { if (en.isIntersecting) renderPage(Number(en.target.dataset.page)); });
+    }, { root: scroller, rootMargin: '900px 0px' });
+    function sizePlaceholders() {
+      pageDivs.forEach(d => {
+        d.style.width = `${Math.round(baseW * scale)}px`;
+        d.style.height = `${Math.round(baseH * scale)}px`;
+      });
+      zoomLabel.value = `${Math.round(scale * 100)}%`;
+    }
+    async function renderPage(n) {
+      if (destroyed || rendered.has(n) || rendering.has(n)) return;
+      rendering.add(n);
+      try {
+        const page = await pdf.getPage(n);
+        if (destroyed) return;
+        const vp = page.getViewport({ scale });
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.floor(vp.width * dpr);
+        canvas.height = Math.floor(vp.height * dpr);
+        canvas.style.cssText = `width:${Math.floor(vp.width)}px;height:${Math.floor(vp.height)}px;display:block;`;
+        const ctx = canvas.getContext('2d');
+        await page.render({ canvas, canvasContext: ctx, viewport: vp, transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : null }).promise;
+        if (destroyed) return;
+        const d = pageDivs[n - 1];
+        d.querySelector('canvas')?.remove();
+        d.insertBefore(canvas, d.firstChild);
+        d.style.width = `${Math.floor(vp.width)}px`;
+        d.style.height = `${Math.floor(vp.height)}px`;
+        rendered.add(n);
+      } catch { /* a page that fails to render stays blank */ } finally {
+        rendering.delete(n);
+      }
+    }
+    for (let n = 1; n <= pdf.numPages; n++) {
+      const d = mk('div', 'position:relative;margin:8px auto;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,0.3);');
+      d.dataset.page = String(n);
+      pageDivs.push(d);
+      scroller.appendChild(d);
+    }
+    function fitWidth() {
+      scale = Math.max(0.3, (scroller.clientWidth - 24) / baseW);
+    }
+    function relayout() {
+      const f = getScrollFraction(scroller);
+      rendered.clear();
+      pageDivs.forEach(d => { d.querySelector('canvas')?.remove(); });
+      sizePlaceholders();
+      pageDivs.forEach(d => { observer.unobserve(d); observer.observe(d); });
+      requestAnimationFrame(() => setScrollFraction(scroller, f));
+    }
+    fitWidth();
+    if (dockSyncOn && lastMainZoom > 0) scale = Math.min(4, Math.max(0.3, lastMainZoom));
+    sizePlaceholders();
+    pageDivs.forEach(d => observer.observe(d));
+    dockSetScale = z => {
+      const ns = Math.min(4, Math.max(0.3, z));
+      if (Math.abs(ns - scale) < 0.005) return;
+      scale = ns;
+      relayout();
+    };
+    zoomIn.addEventListener('click', () => { scale = Math.min(4, scale * 1.2); relayout(); });
+    zoomOut.addEventListener('click', () => { scale = Math.max(0.3, scale / 1.2); relayout(); });
+    fitBtn.addEventListener('click', () => { fitWidth(); relayout(); });
+    const commitZoom = () => {
+      const v = parseFloat(String(zoomLabel.value).replace('%', ''));
+      if (Number.isFinite(v) && v > 0) { scale = Math.min(4, Math.max(0.3, v / 100)); relayout(); } else { zoomLabel.value = `${Math.round(scale * 100)}%`; }
+    };
+    zoomLabel.addEventListener('keydown', e => { e.stopPropagation(); if (e.key === 'Enter') { commitZoom(); zoomLabel.blur(); } });
+    zoomLabel.addEventListener('keyup', e => e.stopPropagation());
+    zoomLabel.addEventListener('blur', commitZoom);
+    commentsBtn.addEventListener('click', () => { list.style.display = list.style.display === 'none' ? 'block' : 'none'; });
+    const updatePage = () => {
+      const probe = scroller.scrollTop + scroller.clientHeight / 3;
+      let cur = 1;
+      for (let i = 0; i < pageDivs.length; i++) { if (pageDivs[i].offsetTop <= probe) cur = i + 1; else break; }
+      pageLabel.textContent = `Page ${cur} of ${pdf.numPages}`;
+    };
+    scroller.addEventListener('scroll', updatePage, { passive: true });
+    updatePage();
+    hookDockScroll(scroller);
+    // ---- comments (read from the PDF's own markup annotations)
+    list.appendChild(mk('div', 'color:#666;', 'Loading comments...'));
+    (async () => {
+      const rows = [];
+      for (let n = 1; n <= pdf.numPages && !destroyed; n++) {
+        try {
+          const page = await pdf.getPage(n);
+          const anns = await page.getAnnotations();
+          anns.forEach(a => {
+            if (!COMMENT_SUBTYPES.has(a.subtype)) return;
+            const contents = String((a.contentsObj && a.contentsObj.str) || a.contents || '').trim();
+            const author = String((a.titleObj && a.titleObj.str) || a.title || '').trim();
+            if (!contents && !author) return;
+            const when = parsePdfDate(a.modificationDate) || parsePdfDate(a.creationDate);
+            rows.push({ page: n, author: author || '(unknown author)', when, contents, kind: a.subtype, rect: a.rect });
+          });
+        } catch { /* skip this page's annotations */ }
+      }
+      if (destroyed) return;
+      dockCommentCount = rows.length;
+      list.textContent = '';
+      const authors = [...new Set(rows.map(r => r.author))];
+      list.appendChild(mk('div', 'font-weight:600;margin-bottom:6px;',
+        rows.length
+          ? `${rows.length} comment${rows.length === 1 ? '' : 's'} by ${authors.join(', ')}`
+          : 'No comment markups were found in this PDF (they may have been flattened into the page image).'));
+      rows.forEach(r => {
+        const item = mk('div', 'border:1px solid #ddd;border-radius:5px;padding:6px;margin:5px 0;cursor:pointer;');
+        item.append(
+          mk('div', 'font-weight:600;', `${r.author}${r.when ? ' • ' + r.when.toLocaleString() : ''}`),
+          mk('div', 'color:#666;', `Page ${r.page} • ${r.kind}`),
+          mk('div', 'white-space:pre-wrap;margin-top:3px;', r.contents || '(no text)')
+        );
+        item.addEventListener('click', async () => {
+          list.style.display = 'none';
+          const d = pageDivs[r.page - 1];
+          try {
+            const page = await pdf.getPage(r.page);
+            const vp = page.getViewport({ scale });
+            const [x1, y1, x2, y2] = vp.convertToViewportRectangle(r.rect);
+            const box = mk('div', `position:absolute;left:${Math.min(x1, x2)}px;top:${Math.min(y1, y2)}px;width:${Math.abs(x2 - x1)}px;height:${Math.abs(y2 - y1)}px;border:2px solid #e67e00;background:rgba(255,200,0,0.25);pointer-events:none;`);
+            d.appendChild(box);
+            setTimeout(() => box.remove(), 2800);
+            scroller.scrollTop = Math.max(0, d.offsetTop + Math.min(y1, y2) - 60);
+          } catch {
+            scroller.scrollTop = Math.max(0, d.offsetTop - 12);
+          }
+        });
+        list.appendChild(item);
+      });
+      commentsBtn.textContent = `Comments (${rows.length})`;
+      if (!rows.length) { commentsBtn.style.display = 'none'; list.style.display = 'none'; }
+    })();
+    dockViewerDestroy = () => {
+      destroyed = true;
+      dockSetScale = null;
+      try { observer.disconnect(); } catch { /* ignore */ }
+      try { pdf.destroy(); } catch { /* ignore */ }
+    };
+  }
+  const MAX_PDF_BYTES = 300 * 1024 * 1024;
+  async function fetchPdfBuffer(uri) {
+    try {
+      if (!isHttpsUrl(uri)) return null;
+      // Fetched with the user's own session; the token only ever goes to
+      // our own origin.
+      const sameOrigin = new URL(uri).origin === window.location.origin;
+      const headers = {};
+      const auth = getAuthorizationHeader();
+      if (sameOrigin && auth) headers.authorization = auth;
+      const res = await fetch(uri, { credentials: 'include', headers });
+      if (!res.ok) return null;
+      const declared = Number(res.headers.get('content-length')) || 0;
+      if (declared > MAX_PDF_BYTES) return null;
+      const buf = await res.arrayBuffer();
+      return buf.byteLength > MAX_PDF_BYTES ? null : buf;
+    } catch {
+      return null;
+    }
+  }
+  async function showDock(uri, labelText, buffer) {
+    const dock = ensureDock();
+    layoutDock();
+    dockCurrentUri = uri;
+    dockBuffer = buffer || null;
+    dockTabKey = activeTab;
+    if (buffer) dockStates.set(dockTabKey, { uri, label: labelText, buffer });
+    document.querySelector('#sdx-prevsub-dock-label').textContent = labelText || 'Consolidated rendition';
+    const body = document.querySelector('#sdx-prevsub-dock-body');
+    body.textContent = 'Loading consolidated PDF...';
+    clearDockTimers();
+    if (dockViewerDestroy) { try { dockViewerDestroy(); } catch { /* ignore */ } dockViewerDestroy = null; }
+    dockMode = 'none';
+    dockScrollEl = null;
+    dockCommentCount = 0;
+    if (dockBlobUrl) {
+      try { URL.revokeObjectURL(dockBlobUrl); } catch { /* ignore */ }
+      dockBlobUrl = '';
+    }
+    dock.style.display = 'flex';
+    hideToast();
+    applyDockHeights();
+    setTimeout(applyDockHeights, 400);
+    try {
+      if (!buffer) throw new Error('the file could not be downloaded');
+      await withTimeout(mountPdfViewer(body, buffer, labelText), 45000, `PDF viewer (${pdfjsStage || 'start'})`);
+      dockMode = 'pdfjs';
+      dockNote = pdfjsNote || 'PDF.js viewer';
+      updateSyncButton();
+      setStatus('<span class="sdx-prevsub-good">Consolidated PDF is open next to the review document. Use Comments in its toolbar to see who made each comment.</span>');
+    } catch (err) {
+      dockMode = 'chrome';
+      dockNote = `PDF.js viewer unavailable: ${String(err && err.message || err).slice(0, 200)}`;
+      if (dockViewerDestroy) { try { dockViewerDestroy(); } catch { /* ignore */ } dockViewerDestroy = null; }
+      body.textContent = '';
+      const frame = document.createElement('iframe');
+      frame.title = 'Consolidated rendition';
+      if (buffer) {
+        dockBlobUrl = URL.createObjectURL(new Blob([buffer], { type: 'application/pdf' }));
+        frame.src = dockBlobUrl;
+      } else {
+        frame.src = isHttpsUrl(uri) ? uri : 'about:blank';
+      }
+      body.appendChild(frame);
+      updateSyncButton();
+      setStatus(`<span class="sdx-prevsub-warn">${escapeHtml(dockNote)}. Showing the browser's PDF viewer instead.</span>`);
+    }
+  }
+  async function showSideBySide(abs, labelText) {
+    setStatus('Fetching consolidated PDF...');
+    const buffer = await fetchPdfBuffer(abs);
+    await showDock(abs, labelText, buffer);
+    closePanel();
+  }
+  async function openConsolidatedDocked(objectObid, labelText, buttonEl) {
+    if (!objectObid) {
+      setStatus('<span class="sdx-prevsub-bad">No rendition Id available for this consolidated record.</span>');
+      return;
+    }
+    const originalText = buttonEl ? buttonEl.textContent : '';
+    if (buttonEl) {
+      buttonEl.disabled = true;
+      buttonEl.textContent = 'Opening...';
+    }
+    try {
+      closePanel();
+      setStatus('Looking up consolidated file...');
+      const fileObid = await findConsolidatedFileCompositionObid(objectObid);
+      const uri = await retrieveFileUri(fileObid);
+      const abs = new URL(uri, window.location.origin).href;
+      await showSideBySide(abs, labelText);
+    } catch (err) {
+      setStatus(`<span class="sdx-prevsub-bad">Could not open side-by-side: ${escapeHtml(err.message)}</span>`);
+      showInfoToast(`Could not open side-by-side: ${err.message}`);
+    } finally {
+      if (buttonEl) {
+        buttonEl.disabled = false;
+        buttonEl.textContent = originalText;
+      }
+    }
+  }
+  window.addEventListener('resize', () => layoutDock());
   function firstNonEmpty(item, names) {
     for (const name of names) {
       if (item && item[name] !== undefined && item[name] !== null && String(item[name]).trim() !== '') {
@@ -1482,9 +2844,6 @@
       returnCode: firstNonEmpty(item, ['Return_Code'])
     };
   }
-  function normalizeConsolidatedResults(json, query) {
-    return extractRawResultArray(json).map(item => normalizeConsolidatedItem(item, query));
-  }
   function dedupeByUid(items) {
     const map = new Map();
     items.forEach(it => {
@@ -1531,9 +2890,10 @@
   // wrong sheet. Only an exact document-number substring counts.
   function sameDocumentNumber(result, detected) {
     const docNo = detected.docNo || '';
-    if (!docNo) return false;
+    if (!docNo && !detected.altDocNo) return false;
     const haystack = [result.name, result.altName, result.attachedFile].join(' ').toLowerCase();
-    return haystack.includes(docNo.toLowerCase());
+    if (haystack.includes(docNo.toLowerCase())) return true;
+    return Boolean(detected.altDocNo && haystack.includes(detected.altDocNo.toLowerCase()));
   }
   // Same idea as sameDocumentNumber, but also accepts the short
   // "PKG-SEQ" form (e.g. "CIT-0276") since the Consolidated Renditions
@@ -1544,6 +2904,7 @@
     const pkgSeq = pkg && seq ? `${pkg}-${seq}` : '';
     if (detected.docNo && haystack.includes(detected.docNo.toLowerCase())) return true;
     if (pkgSeq && haystack.includes(pkgSeq.toLowerCase())) return true;
+    if (detected.altDocNo && haystack.includes(detected.altDocNo.toLowerCase())) return true;
     return false;
   }
   function scoreResult(result, detected) {
@@ -1845,8 +3206,11 @@
           <div>Classification: <code>${escapeHtml(item.classification || '')}</code></div>
           <div>Returned: <code>${escapeHtml(item.updated || item.created || '')}</code></div>
           <div>Rendition Id: <code>${escapeHtml(item.obid || '')}</code></div>
+          <button class="best" data-dock-consolidated-obid="${escapeHtml(item.obid || '')}" data-dock-label="${escapeHtml(item.name || item.title || 'Consolidated rendition')}">
+            Open Side-by-Side (with prior review comments)
+          </button>
           <button class="best" data-open-consolidated-obid="${escapeHtml(item.obid || '')}">
-            Open Consolidated PDF (with prior review comments)
+            Open Consolidated PDF in New Tab
           </button>
           <button class="secondary" data-open-rev="${escapeHtml(listUrl)}">
             Open Consolidated Renditions List Fallback
@@ -1873,6 +3237,9 @@
     }
     refreshProjectConfig();
     const detected = detectCurrentDocument();
+    if (!detected.docNo && getContextObjectObid() && getContextObjectObid() !== contextFetchedFor) {
+      fetchContextDocument().then(found => { if (found) refreshPanel(); });
+    }
     const queries = createQueries(detected);
     const docEl = document.querySelector('#sdx-prevsub-doc');
     const titleEl = document.querySelector('#sdx-prevsub-title');
@@ -1885,10 +3252,16 @@
     if (titleEl) titleEl.textContent = detected.title || 'Not detected';
     if (revEl) revEl.textContent = detected.currentRev || 'Not detected';
     if (sourceEl) sourceEl.textContent = detected.source || 'none';
+    const companionEl = document.querySelector('#sdx-prevsub-companion');
+    if (companionEl) {
+      companionEl.textContent =
+        `extension frame: ${frameStatusAt ? 'connected' : 'NOT connected'}; ` +
+        `viewer frame: ${viewerStatusAt ? (placedLauncherRect() ? 'connected, button placed' : 'connected, toolbar not found') : 'NOT connected'}`;
+    }
     if (projectEl) {
       projectEl.textContent = projectConfigDetected
         ? SETTINGS.projectConfigUid
-        : `${SETTINGS.projectConfigUid} (fallback - could not detect from URL)`;
+        : 'not detected from the page URL';
       projectEl.className = projectConfigDetected ? 'sdx-prevsub-good' : 'sdx-prevsub-bad';
     }
     if (queriesEl) {
@@ -1928,13 +3301,13 @@
     setTimeout(refreshPanel, 350);
     setTimeout(refreshPanel, 1200);
   }
-  async function runConsolidatedSearch(detected, onStep) {
+  async function runConsolidatedSearch(detected, onStep, silent) {
     const consolidatedQueries = createConsolidatedQueries(detected);
     const all = [];
     const errors = [];
     for (let i = 0; i < consolidatedQueries.length; i++) {
       const q = consolidatedQueries[i];
-      setStatus(`Checking Consolidated Renditions ${i + 1} of ${consolidatedQueries.length}: <code>${escapeHtml(q)}</code>`);
+      if (!silent) setStatus(`Checking Consolidated Renditions ${i + 1} of ${consolidatedQueries.length}: <code>${escapeHtml(q)}</code>`);
       try {
         const json = await apiSearch(q, SETTINGS.consolidatedEntityType, undefined, SETTINGS.consolidatedSearchFields);
         all.push(...normalizeConsolidatedResults(json, q));
@@ -2134,6 +3507,9 @@
     document.querySelectorAll('[data-open-consolidated-obid]').forEach(btn => {
       btn.addEventListener('click', () => openConsolidatedPdf(btn.getAttribute('data-open-consolidated-obid'), btn));
     });
+    document.querySelectorAll('[data-dock-consolidated-obid]').forEach(btn => {
+      btn.addEventListener('click', () => openConsolidatedDocked(btn.getAttribute('data-dock-consolidated-obid'), btn.getAttribute('data-dock-label'), btn));
+    });
     document.querySelectorAll('[data-copy-json]').forEach(btn => {
       btn.addEventListener('click', () => {
         copyText(btn.getAttribute('data-copy-json'));
@@ -2172,6 +3548,9 @@
     document.querySelectorAll('[data-open-consolidated-obid]').forEach(btn => {
       btn.addEventListener('click', () => openConsolidatedPdf(btn.getAttribute('data-open-consolidated-obid'), btn));
     });
+    document.querySelectorAll('[data-dock-consolidated-obid]').forEach(btn => {
+      btn.addEventListener('click', () => openConsolidatedDocked(btn.getAttribute('data-dock-consolidated-obid'), btn.getAttribute('data-dock-label'), btn));
+    });
     document.querySelectorAll('[data-copy-json]').forEach(btn => {
       btn.addEventListener('click', () => {
         copyText(btn.getAttribute('data-copy-json'));
@@ -2190,10 +3569,22 @@
       detected,
       queries,
       consolidatedQueries,
+      companion: {
+        connected: frameModeActive(),
+        statusAgeMs: frameStatusAt ? Date.now() - frameStatusAt : null,
+        launcherRectAbsolute: placedLauncherRect(),
+        viewerLauncherRect,
+        qarcViewerRect,
+        viewerReported: viewerDiag,
+        pdfViewer: { activeTab, overlayOpen, dockTabKey, savedTabs: Array.from(dockStates.keys()), mode: dockMode, note: dockNote, stage: pdfjsStage, mainZoom: lastMainZoom, zoomSrc: lastZoomSrc, comments: dockCommentCount, syncOn: dockSyncOn, viewerUrlKnown: Boolean(pdftronUrl) },
+        autoCheck: { enabled: USER_SETTINGS.autoCheckConsolidated, lastKey: autoKeyDone, match: autoMatch ? autoMatch.name : null, note: autoNote },
+        viewerStatusAgeMs: viewerStatusAt ? Date.now() - viewerStatusAt : null,
+        qarcFrameFound: Boolean(findQarcFrame()),
+        reported: frameDiag
+      },
+      layoutDebug: describeLayout(),
+      detectionDebug: { ...lastDetectionDebug, context: contextDebug, altDocNo: detected.altDocNo || '' },
       authStatus,
-      authPreview: getAuthorizationHeader()
-        ? getAuthorizationHeader().slice(0, 18) + '...'
-        : '',
       userSettings: USER_SETTINGS,
       settings: {
         projectConfigUid: SETTINGS.projectConfigUid,
@@ -2226,19 +3617,16 @@
       removeUi();
       return;
     }
-    if (document.querySelector('#sdx-prevsub-btn')) {
+    if (document.querySelector('#sdx-prevsub-panel')) {
+      startLauncherLoop();
       return;
     }
     addStyles();
-    const btn = document.createElement('button');
-    btn.id = 'sdx-prevsub-btn';
-    btn.type = 'button';
-    btn.textContent = '🧟 Prev Doc Ver';
     const panel = document.createElement('div');
     panel.id = 'sdx-prevsub-panel';
     panel.innerHTML = `
       <div class="sdx-prevsub-header">
-        <h3>SDx Previous Document Version Finder v2.0</h3>
+        <h3>SDx Previous Document Version Finder v3.0.0</h3>
         <button type="button" id="sdx-prevsub-close" class="sdx-prevsub-close-btn" title="Close">&times;</button>
       </div>
       <div class="sdx-row">
@@ -2263,6 +3651,10 @@
       <div class="sdx-row">
         Project:
         <code id="sdx-prevsub-project">Detecting...</code>
+      </div>
+      <div class="sdx-row">
+        Toolbar companion:
+        <code id="sdx-prevsub-companion">Checking...</code>
       </div>
       <div class="sdx-row">
         Token status:
@@ -2292,6 +3684,12 @@
         </div>
         <div class="sdx-row">
           <label class="sdx-prevsub-checkbox-row">
+            <input type="checkbox" id="sdx-prevsub-setting-autocheck">
+            Automatically check for a consolidated version when a review opens
+          </label>
+        </div>
+        <div class="sdx-row">
+          <label class="sdx-prevsub-checkbox-row">
             <input type="checkbox" id="sdx-prevsub-setting-idle-enabled">
             Also auto-close after inactivity, seconds:
           </label>
@@ -2313,6 +3711,11 @@
           <br>
           <input type="text" id="sdx-prevsub-setting-historyobid" maxlength="64">
         </div>
+        <div class="sdx-row">
+          Side-by-side: right pane width override, px (0 = auto):
+          <br>
+          <input type="number" id="sdx-prevsub-setting-dockoffset" min="0" max="1200" step="10">
+        </div>
         <button id="sdx-prevsub-settings-save">Save Settings</button>
         <button id="sdx-prevsub-settings-cancel" class="secondary">Cancel</button>
         <button id="sdx-prevsub-copy-debug" class="secondary">Copy Debug</button>
@@ -2321,7 +3724,7 @@
       <div id="sdx-prevsub-results"></div>
     `;
     document.body.appendChild(panel);
-    document.body.appendChild(btn);
+    startLauncherLoop();
     const scrollTopBtn = document.createElement('button');
     scrollTopBtn.id = 'sdx-prevsub-scroll-top';
     scrollTopBtn.type = 'button';
@@ -2338,7 +3741,6 @@
     panel.addEventListener('click', scheduleAutoClose);
     panel.addEventListener('keydown', scheduleAutoClose);
     panel.addEventListener('input', scheduleAutoClose);
-    btn.addEventListener('click', togglePanel);
     document.querySelector('#sdx-prevsub-close').addEventListener('click', closePanel);
     document.querySelector('#sdx-prevsub-run').addEventListener('click', runApiSearch);
     document.querySelector('#sdx-prevsub-refresh').addEventListener('click', forceFreshDetection);
@@ -2368,6 +3770,8 @@
         document.querySelector('#sdx-prevsub-setting-maxresults').value = USER_SETTINGS.maxDisplayedResults;
         document.querySelector('#sdx-prevsub-setting-entitytype').value = USER_SETTINGS.advancedEntityType;
         document.querySelector('#sdx-prevsub-setting-historyobid').value = USER_SETTINGS.advancedHistoryMethodObid;
+        document.querySelector('#sdx-prevsub-setting-dockoffset').value = USER_SETTINGS.dockRightOffsetPx;
+        document.querySelector('#sdx-prevsub-setting-autocheck').checked = USER_SETTINGS.autoCheckConsolidated;
       }
     });
     document.querySelector('#sdx-prevsub-settings-save').addEventListener('click', () => {
@@ -2383,8 +3787,12 @@
         autoCloseSeconds: autoCloseInput,
         maxDisplayedResults: maxResultsInput,
         advancedEntityType,
-        advancedHistoryMethodObid
+        advancedHistoryMethodObid,
+        dockRightOffsetPx: document.querySelector('#sdx-prevsub-setting-dockoffset').value,
+        autoCheckConsolidated: document.querySelector('#sdx-prevsub-setting-autocheck').checked
       });
+      document.querySelector('#sdx-prevsub-setting-dockoffset').value = saved.dockRightOffsetPx;
+      layoutDock();
       outsideClickInput.checked = saved.closeOnOutsideClick;
       idleEnabledInput.checked = saved.idleTimeoutEnabled;
       autoCloseSecondsInput.value = saved.autoCloseSeconds;
@@ -2404,6 +3812,149 @@
     document.querySelector('#sdx-prevsub-copy-debug').addEventListener('click', copyDebugInfo);
     installPanelAutoCloseWatchers();
     forceFreshDetection();
+  }
+  /********************************************************************
+   * AUTOMATIC CONSOLIDATED-VERSION CHECK + POPUP
+   ********************************************************************/
+  let autoKeyDone = '';
+  let dockSetScale = null;
+  let dockBuffer = null;
+  let lastZoomSrc = '';
+  let lastMainZoom = 0;
+  let ribbonAbs = null;
+  let autoKeySeen = '';
+  let autoSeenAt = 0;
+  const AUTO_CHECK_DELAY_MS = 3000;
+  let autoRunning = false;
+  let autoMatch = null;
+  let autoNote = '';
+  let autoRetryAt = 0;
+  let toastTimer = 0;
+  let toastPosTimer = 0;
+  function autoKeyNow() {
+    const d = detectCurrentDocument();
+    return d.docNo ? `${d.docNo}|${d.altDocNo || ''}|${getContextObjectObid()}` : '';
+  }
+  function isExactConsolidatedMatch(item, detected) {
+    const norm = v => String(v || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    const name = norm(item.name);
+    const alt = norm(item.altName);
+    const wanted = [detected.docNo, detected.altDocNo].map(norm).filter(Boolean);
+    return wanted.some(w => name === w || alt === w || name.includes(w) || alt.includes(w));
+  }
+  function hideToast() {
+    clearTimeout(toastTimer);
+    clearInterval(toastPosTimer);
+    document.querySelector('#sdx-prevsub-toast')?.remove();
+  }
+  function positionToast() {
+    const t = document.querySelector('#sdx-prevsub-toast');
+    if (!t) return;
+    let r = placedLauncherRect();
+    if (!r) {
+      const b = document.getElementById(LAUNCHER_ID);
+      if (b) { const br = b.getBoundingClientRect(); r = [br.left, br.top, br.right, br.bottom]; }
+    }
+    if (!r) { t.style.top = 'auto'; t.style.bottom = '16px'; t.style.right = '16px'; return; }
+    t.style.right = `${Math.max(12, Math.round(window.innerWidth - r[2]))}px`;
+    if (r[3] > window.innerHeight / 2) {      // floating button near the bottom: open upward
+      t.style.top = 'auto';
+      t.style.bottom = `${Math.round(window.innerHeight - r[1] + 8)}px`;
+    } else {
+      t.style.bottom = 'auto';
+      t.style.top = `${Math.round(r[3] + 8)}px`;
+    }
+  }
+  function buildToast(autoHideMs) {
+    hideToast();
+    const t = document.createElement('div');
+    t.id = 'sdx-prevsub-toast';
+    t.style.cssText = 'position:fixed;z-index:2147483646;width:230px;box-sizing:border-box;background:#fff;color:#222;border:1px solid #c8c8c8;border-left:3px solid #6c4bd3;border-radius:5px;box-shadow:0 2px 8px rgba(0,0,0,0.22);padding:6px 8px;font:11px "Segoe UI",Arial,sans-serif;';
+    document.body.appendChild(t);
+    positionToast();
+    toastPosTimer = setInterval(positionToast, 1000);
+    toastTimer = setTimeout(hideToast, autoHideMs);
+    return t;
+  }
+  function toastButton(text, primary, fn) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = text;
+    b.style.cssText = `border:1px solid #6c4bd3 !important;border-radius:3px !important;padding:3px 10px !important;font-size:10px !important;line-height:1.2 !important;cursor:pointer;margin:0 !important;width:auto !important;min-width:0 !important;height:auto !important;white-space:nowrap !important;flex:0 0 auto !important;${primary ? 'background:#6c4bd3 !important;color:#fff !important;' : 'background:#fff !important;color:#6c4bd3 !important;'}`;
+    b.addEventListener('click', fn);
+    return b;
+  }
+  function showInfoToast(text) {
+    const t = buildToast(9000);
+    const line = document.createElement('div');
+    line.textContent = text;
+    t.appendChild(line);
+  }
+  function showConsolidatedToast(item) {
+    const t = buildToast(30000);
+    const title = document.createElement('div');
+    title.style.cssText = 'font-weight:600;margin-bottom:1px;';
+    title.textContent = 'Consolidated match found';
+    const sub = document.createElement('div');
+    sub.style.cssText = 'color:#555;margin-bottom:5px;';
+    const bits = [];
+    if (item.revision !== undefined && item.revision !== '') bits.push(`Rev ${item.revision}`);
+    const returned = item.updated || item.created;
+    if (returned) bits.push(`returned ${returned}`);
+    sub.textContent = `${bits.length ? bits.join(' • ') + '. ' : ''}Open side by side?`;
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;flex-direction:row;gap:6px;align-items:center;';
+    row.append(
+      toastButton('Open', true, () => {
+        hideToast();
+        openConsolidatedDocked(item.obid, item.name, null);
+      }),
+      toastButton('Dismiss', false, hideToast)
+    );
+    t.append(title, sub, row);
+  }
+  // True when this review tab already has a side-by-side open.
+  function sideBySideOpenForTab() {
+    if (activeTab && dockStates.has(activeTab)) return true;
+    return Boolean(document.querySelector('#sdx-prevsub-dock')) && dockTabKey === activeTab;
+  }
+  async function autoCheckTick() {
+    try {
+      if (!USER_SETTINGS.autoCheckConsolidated || !shouldShowHelper() || autoRunning) return;
+      if (Date.now() < autoRetryAt || !getAuthorizationHeader()) return;
+      const detected = detectCurrentDocument();
+      if (!detected.docNo) return;
+      const key = autoKeyNow();
+      if (!key || key === autoKeyDone) return;
+      if (sideBySideOpenForTab()) { autoKeyDone = key; autoNote = 'side-by-side already open for this tab'; hideToast(); return; }
+      if (key !== autoKeySeen) { autoKeySeen = key; autoSeenAt = Date.now(); }
+      if (Date.now() - autoSeenAt < AUTO_CHECK_DELAY_MS) return;
+      autoRunning = true;
+      autoKeyDone = key;
+      autoMatch = null;
+      autoNote = 'checking';
+      hideToast();
+      const { matches, errors } = await runConsolidatedSearch(detected, null, true);
+      autoRunning = false;
+      if (!matches.length && errors.length) {
+        autoNote = `search errors: ${errors[0].slice(0, 120)}`;
+        autoKeyDone = '';                     // try again shortly
+        autoRetryAt = Date.now() + 15000;
+        return;
+      }
+      if (autoKeyNow() !== key) { autoNote = 'document changed during check'; return; }
+      const exact = matches.filter(m => isExactConsolidatedMatch(m, detected));
+      autoNote = exact.length ? 'exact match found' : `no exact match (${matches.length} loose)`;
+      if (exact.length && sideBySideOpenForTab()) {
+        autoNote = 'exact match found (side-by-side already open)';
+      } else if (exact.length) {
+        autoMatch = exact[0];
+        showConsolidatedToast(autoMatch);
+      }
+    } catch (err) {
+      autoRunning = false;
+      autoNote = `error: ${String(err && err.message || err).slice(0, 120)}`;
+    }
   }
   /********************************************************************
    * BOOT
@@ -2433,6 +3984,9 @@
     function handleRouteChange() {
       if (window.location.href === lastHref) return;
       lastHref = window.location.href;
+      hideToast();
+      autoKeyDone = '';
+      autoKeySeen = '';
       if (shouldShowHelper()) {
         createUi();
         clearPerPageState();
@@ -2446,6 +4000,25 @@
     window.addEventListener('hashchange', handleRouteChange);
     window.addEventListener('popstate', handleRouteChange);
     setInterval(handleRouteChange, 500);
+    setInterval(autoCheckTick, 2500);
+    setInterval(() => {
+      try {
+        const dockEl = document.querySelector('#sdx-prevsub-dock');
+        if (dockEl) {
+          if (overlayOpen || (activeTab && dockTabKey && activeTab !== dockTabKey)) closeDock();   // state is kept for its own tab
+        } else if (!overlayOpen && activeTab && !dockReopening && dockStates.has(activeTab)) {
+          const st = dockStates.get(activeTab);
+          dockReopening = true;
+          showDock(st.uri, st.label, st.buffer).finally(() => { dockReopening = false; });
+        }
+      } catch { /* ignore */ }
+    }, 500);
   }
-  boot();
+  if (IS_QARC_COMPANION) {
+    startFrameModule();
+  } else if (IS_VIEWER_COMPANION) {
+    startViewerModule();
+  } else {
+    boot();
+  }
 })();
