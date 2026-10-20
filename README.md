@@ -19,3 +19,5 @@ user will be presented links to the document history (where comments are not sho
 
 
 User can click the "Open consolidated pdf" and be directly taken to the previous version with comments. 
+
+v3.0 exists to accomodate the new built in SDx viewer to allow side by side review. 
