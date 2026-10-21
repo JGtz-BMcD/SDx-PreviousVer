@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDx Previous Document Version Finder
 // @namespace    bmcd-sdx-Previous
-// @version      3.0.0
+// @version      3.0.1
 // @description  Finds previous SDx document versions and consolidated (previously reviewed) renditions, and opens the consolidated PDF side by side with the document under review.
 // @author       Josue Gutierrez
 // @match        https://bum04-sdx.intergraphsmartcloud.com/*
@@ -2843,6 +2843,9 @@
       revState: firstNonEmpty(item, ['Rev_State']),
       returnCode: firstNonEmpty(item, ['Return_Code'])
     };
+  }
+  function normalizeConsolidatedResults(json, query) {
+    return extractRawResultArray(json).map(item => normalizeConsolidatedItem(item, query));
   }
   function dedupeByUid(items) {
     const map = new Map();
